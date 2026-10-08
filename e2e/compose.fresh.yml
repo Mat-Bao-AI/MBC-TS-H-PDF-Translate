@@ -1,0 +1,27 @@
+# Stack E2E DÙNG MỘT LẦN: DB trống → /setup. Độc lập — KHÔNG chồng lên docker-compose.yml.
+#   export $(cat .build/local.env)                                      # SECRET_KEY (compose đọc lúc nạp tệp này)
+#   docker compose -p pdf-translate-e2e -f e2e/compose.fresh.yml down -v       # CHỈ project pdf-translate-e2e: DB trống cho /setup
+#   docker compose -p pdf-translate-e2e -f e2e/compose.fresh.yml up -d --no-build
+#   (cd e2e && npx playwright test)
+#   docker compose -p pdf-translate-e2e -f e2e/compose.fresh.yml down -v       # dọn — CHỈ project pdf-translate-e2e
+name: pdf-translate-e2e  # quên -p vẫn không đụng project pdf-translate (stack chạy thử có dữ liệu)
+services:
+  app:
+    image: vi-translate-saas:e2e  # worker giả (e2e/Dockerfile.e2e) — không gọi Google
+    ports:
+      - "127.0.0.1:18082:8000"  # chỉ loopback, như docker-compose.yml (X-Forwarded-For được tin)
+    environment:
+      SECRET_KEY: ${SECRET_KEY:?Đặt SECRET_KEY (export $(cat .build/local.env))}
+      APP_BASE_URL: http://localhost:18082
+      MAIL_DEV_LOG: "1"  # thư in ra log nhưng TÍNH LÀ đã cấu hình: xác nhận email vẫn bắt buộc, link đọc từ log
+      MAX_UPLOAD_MB: 50
+      MAX_CONCURRENT_JOBS: 1
+      MAX_PENDING_PER_USER: 3
+    volumes:
+      - app-data:/data  # → pdf-translate-e2e_app-data
+    restart: on-failure
+    security_opt:
+      - no-new-privileges:true  # như docker-compose.yml
+
+volumes:
+  app-data:

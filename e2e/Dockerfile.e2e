@@ -1,0 +1,3 @@
+FROM vi-translate-saas:local
+COPY fake_worker.py /app/e2e-fake-worker.py
+ENV WORKER_CMD="python /app/e2e-fake-worker.py"

@@ -1,0 +1,26 @@
+backend/.venv/
+backend/.data/
+.build/
+**/__pycache__/
+.pytest_cache/
+.coverage
+frontend/node_modules/
+frontend/dist/
+e2e/node_modules/
+e2e/test-results/
+e2e/playwright-report/
+
+# public-release hygiene
+.env
+.env.*
+*.env
+!.env.example
+.superpowers/
+.venv/
+node_modules/
+*.db
+*.sqlite
+*.sqlite3
+
+# internal plans/specs stay local (moved to .build/internal/superpowers/)
+docs/superpowers/

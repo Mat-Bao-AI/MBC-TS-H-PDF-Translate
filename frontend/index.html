@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PDF Translate</title>
+    <style>
+      /* Chừa sẵn chỗ thanh cuộn: trang ngắn (đang tải) và trang dài không còn xê dịch bố cục ngang 15px khi chuyển menu. */
+      html { scrollbar-gutter: stable; }
+      /* Gamut Dialog khoá cuộn bằng margin-right 15px trên body — có gutter ổn định thì không cần bù nữa
+         (tiền tố `html` để thắng style thư viện chèn sau). */
+      html body[data-scroll-locked] { margin-right: 0 !important; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,93 @@
+PDF Translate (vi-translate-saas)
+Copyright (C) 2026 Mắt Bão
+
+Chương trình này là phần mềm tự do: bạn có thể phân phối lại và/hoặc sửa đổi
+nó theo các điều khoản của Giấy phép Công cộng GNU Affero (GNU Affero General
+Public License) do Free Software Foundation công bố, phiên bản 3 của Giấy
+phép, hoặc (tuỳ bạn chọn) bất kỳ phiên bản nào sau đó.
+
+Chương trình được phân phối với hy vọng nó hữu ích, nhưng KHÔNG CÓ BẢO ĐẢM
+NÀO, kể cả bảo đảm ngầm định về khả năng thương mại hay sự phù hợp cho một
+mục đích cụ thể. Xem Giấy phép Công cộng GNU Affero để biết thêm chi tiết.
+Bản đầy đủ của giấy phép nằm trong tệp LICENSE (văn bản gốc tiếng Anh, không sửa).
+
+(English: This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by the
+Free Software Foundation, either version 3 of the License, or (at your option)
+any later version. It is distributed WITHOUT ANY WARRANTY; see the licence text
+in LICENSE.)
+
+AGPL-3.0 §13: người vận hành cho người dùng truy cập chương trình qua mạng phải
+cung cấp mã nguồn tương ứng của bản đang chạy. Biến môi trường SOURCE_URL hiện
+liên kết "Mã nguồn" ở chân trang.
+
+----------------------------------------------------------------------------
+Dựa trên VI-Translate
+----------------------------------------------------------------------------
+- VI-Translate — tác giả gốc: breslee1707, https://github.com/breslee1707/VI-Translate,
+  commit ae156cf2792131009e6919f109e752141e2b2e11, AGPL-3.0.
+  Không nằm trong kho mã này: Dockerfile kéo đúng commit đó lúc build (ARG
+  UPSTREAM_REPO / UPSTREAM_REF) từ bản fork của Mắt Bão
+  (https://github.com/Mat-Bao-AI/MBC-TS-H-PDF-Translate, nhánh main, cùng commit) và
+  không sửa mã của nó. Bản sao giấy phép của
+  upstream nằm trong image tại /app/upstream/LICENSE (giống LICENSE ở đây);
+  thông báo bên thứ ba của upstream tại /app/upstream/THIRD_PARTY_NOTICES.md.
+
+Thành phần mà THIRD_PARTY_NOTICES.md của upstream (đọc từ image) nêu:
+- pdf2zh (nhánh lõi giữ bố cục, dẫn xuất từ PDFMathTranslate 1.9.11,
+  https://github.com/PDFMathTranslate/PDFMathTranslate) — AGPL-3.0, theo
+  THIRD_PARTY_NOTICES.md của upstream.
+- BabelDOC 0.2.33 (https://github.com/funstory-ai/BabelDOC) — AGPL-3.0; siêu dữ
+  liệu gói trong image ghi `License: AGPL-3.0`.
+- Văn bản tài liệu được gửi tới dịch vụ Google Translate (engine "google_free")
+  hoặc tới Gemini / Google Cloud Translation bằng khoá của người dùng; Google
+  không tài trợ hay xác nhận phần mềm này (theo THIRD_PARTY_NOTICES.md).
+
+Tài sản được nướng vào image (tải qua trình nạp tài sản của BabelDOC, scripts/fetch_assets.py của upstream):
+- Mô hình bố cục DocLayout-YOLO-DocStructBench (ONNX, doclayout.onnx; nguồn
+  huggingface.co/wybxc/DocLayout-YOLO-DocStructBench-onnx theo
+  babeldoc/assets/embedding_assets_metadata.py) — giấy phép: CHƯA XÁC MINH
+  (THIRD_PARTY_NOTICES.md của upstream không nêu).
+- Phông GoNotoKurrent-Regular.ttf (phông chữ của bản PDF dịch; upstream
+  scripts/fetch_assets.py) — giấy phép: CHƯA XÁC MINH (THIRD_PARTY_NOTICES.md
+  của upstream không nêu).
+
+----------------------------------------------------------------------------
+Phông chữ đi kèm
+----------------------------------------------------------------------------
+- Liberation Fonts (gói Debian fonts-liberation 1:2.1.5-3; phông dự phòng của bản dịch) — SIL-OFL-1.1,
+  theo /usr/share/doc/fonts-liberation/copyright trong image.
+- Be Vietnam Pro (phông giao diện, tự host; npm @fontsource/be-vietnam-pro 5.3.0)
+  — SIL-OFL-1.1, Copyright 2021 The Be Vietnam Pro Project Authors
+  (https://github.com/bettergui/BeVietnamPro), theo LICENSE của gói npm.
+
+----------------------------------------------------------------------------
+Thư viện chính (giấy phép đọc từ siêu dữ liệu gói, không phải từ trí nhớ)
+----------------------------------------------------------------------------
+Giao diện (frontend/package.json, dependencies; đọc `license` trong node_modules):
+- @codecademy/gamut 73.6.1 — MIT
+- @codecademy/gamut-icons 10.2.0 — MIT
+- @codecademy/gamut-styles 21.2.0 — MIT
+- @emotion/react 11.14.0 — MIT
+- @emotion/styled 11.14.1 — MIT
+- react 18.3.1 — MIT
+- react-dom 18.3.1 — MIT
+- react-router-dom 7.18.4 — MIT
+
+Máy chủ (backend/requirements.txt; đọc bằng importlib.metadata trong image):
+- fastapi 0.142.2 — MIT
+- uvicorn 0.54.0 — BSD-3-Clause
+- python-multipart 0.0.32 — Apache-2.0
+- SQLAlchemy 2.1.1 — MIT
+- alembic 1.20.0 — MIT
+- argon2-cffi 25.1.0 — MIT
+- email-validator 2.3.0 — Unlicense
+- cryptography 50.0.2 — Apache-2.0 OR BSD-3-Clause
+- requests 2.34.2 — Apache-2.0
+
+Phụ thuộc của lõi dịch (cài từ requirements.txt của upstream, không phải do repo này chọn; chỉ nêu các gói đáng chú ý):
+- PyMuPDF 1.25.2 — "GNU AFFERO GPL 3.0" (siêu dữ liệu gói)
+- pdfminer.six 20250416 — MIT
+- onnxruntime 1.20.1 — MIT
+
+Danh sách đầy đủ phụ thuộc bắc cầu: CHƯA LẬP (xem `pip list` / `npm ls` trong image).

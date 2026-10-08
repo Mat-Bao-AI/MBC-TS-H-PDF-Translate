@@ -1,0 +1,34 @@
+# Chạy thử trên máy cá nhân. Triển khai thật (PaaS / máy chủ Docker): xem docs/DEPLOY.md — nền tảng PaaS bỏ qua tệp này.
+services:
+  app:
+    build: .
+    image: vi-translate-saas:local
+    ports:
+      # Chỉ loopback: container tin X-Forwarded-For (FORWARDED_ALLOW_IPS="*" trong Dockerfile), mở ra
+      # mọi interface thì ai trong mạng cũng giả được IP để lách giới hạn đăng nhập sai.
+      - "127.0.0.1:18081:8000"
+    environment:
+      SECRET_KEY: ${SECRET_KEY:?Đặt SECRET_KEY (ít nhất 32 ký tự)}
+      APP_BASE_URL: ${APP_BASE_URL:-}  # rỗng = địa chỉ ghi lúc chạy /setup (vd http://localhost:18081); chỉ dùng cho link trong thư
+      SETUP_TOKEN: ${SETUP_TOKEN:-}  # rỗng = /setup không hỏi mã; đặt khi cổng mở cho người khác
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}  # rỗng = 587, hoặc 465 khi SMTP_SECURITY=ssl (config.py)
+      SMTP_SECURITY: ${SMTP_SECURITY:-}  # rỗng = starttls
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      MAIL_DEV_LOG: ${MAIL_DEV_LOG:-}  # 1 = thư in ra log, vẫn tính là đã cấu hình (chỉ dev / E2E)
+      SOURCE_URL: ${SOURCE_URL:-}
+      MAX_UPLOAD_MB: 50
+      MAX_CONCURRENT_JOBS: 1
+      MAX_PENDING_PER_USER: 3
+    volumes:
+      - app-data:/data
+    restart: on-failure
+    # Không tiến trình nào trong container được nhận thêm quyền qua execve (setuid…); entrypoint vẫn hạ được quyền
+    # khi bật bằng user 0 (hạ quyền không phải "nhận thêm").
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  app-data:
