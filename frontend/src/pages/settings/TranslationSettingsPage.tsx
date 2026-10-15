@@ -1,15 +1,21 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Alert, Anchor, Box, Card, Dialog, FillButton, FlexBox, FormGroup, Input, Radio, RadioGroup, Select,
-  StrokeButton, Text,
+  StrokeButton, Text, Toggle,
 } from '@codecademy/gamut';
-import { toApiError, type ApiError } from '../../api/client';
-import { settingsApi, type CredentialInfo, type EngineMode, type Provider, type SettingsInfo } from '../../api/settings';
+import { useAuth } from '../../auth/AuthContext';
+import { ApiError, toApiError } from '../../api/client';
+import { profilesApi } from '../../api/profiles';
+import {
+  TRANSLATION_SETTINGS_CACHE_KEY, settingsApi, type CredentialInfo, type EngineMode, type ProfileItem, type Provider, type SettingsInfo, type StyleValues,
+} from '../../api/settings';
 import {
   chosenEngine, engineLabel, initialChoice, isAvailable, modelOptions, shortModelLabel, switchMode, type EngineChoice,
 } from '../../files/engines';
 import { fontOptions } from '../../files/fonts';
+import { STYLE_DEFAULTS, findProfile, profileOptions, styleOf } from '../../files/profiles';
 import { errorText, t, type MessageKey } from '../../i18n/t';
+import { ProfileFormFields } from '../../components/ProfileFormFields';
 import { SkeletonCard } from '../../components/SkeletonCard';
 import { formatRelative } from '../../lib/relativeTime';
 import { cacheGet, cacheSet } from '../../lib/swrCache';
@@ -27,10 +33,12 @@ type KeyCardProps = {
   link: string;
   credential: CredentialInfo | undefined;
   defaultEngine: string;
+  /** Xoá key này sẽ tắt Chế độ nâng cao (đang bật và đây là key của engine mặc định). */
+  deleteTurnsOffAdvance: boolean;
   onChanged: (settings: SettingsInfo) => void;
 };
 
-function KeyCard({ provider, label, description, link, credential, defaultEngine, onChanged }: KeyCardProps) {
+function KeyCard({ provider, label, description, link, credential, defaultEngine, deleteTurnsOffAdvance, onChanged }: KeyCardProps) {
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
@@ -124,16 +132,20 @@ function KeyCard({ provider, label, description, link, credential, defaultEngine
         cancelCta={{ children: t('common.cancel'), onClick: () => setConfirming(false) }}
       >
         {t('settings.key.deleteBody', { label })}
+        {deleteTurnsOffAdvance && <Text as="p" fontSize={14} mt={8}>{t('settings.key.deleteTurnsOffAdvance')}</Text>}
       </Dialog>
     </Card>
   );
 }
 
-const CACHE_KEY = 'settings:translation';
+const CACHE_KEY = TRANSLATION_SETTINGS_CACHE_KEY;
 // Đo trên Chromium 1366px: thẻ chế độ ~617, thẻ Gemini ~349, thẻ Cloud ~316, tiêu đề "API key" ~29.
 const SKELETON_MODE_HEIGHT = 617;
 const SKELETON_GEMINI_HEIGHT = 349;
 const SKELETON_CLOUD_HEIGHT = 316;
+
+/** Form hồ sơ tại chỗ (✎ Sửa / + Hồ sơ mới) dưới ô "Hồ sơ mặc định khi tải lên" (spec 2026-10-15 §9); null = đóng. */
+type ProfileDraft = { id: string | null; title: string; name: string; style: StyleValues };
 
 /** Cài đặt › Dịch thuật (nằm trong SettingsLayout: tiêu đề trang + khung 1200px do layout lo). */
 export function TranslationSettingsPage() {
@@ -145,27 +157,42 @@ export function TranslationSettingsPage() {
     return cached ? initialChoice(cached) : null;
   });
   const [font, setFont] = useState(() => cacheGet<SettingsInfo>(CACHE_KEY)?.default_font ?? 'auto');
-  // Hai ô Select là uncontrolled: tăng sau mỗi phản hồi settings để remount chúng với đúng giá trị state
+  const { refreshUser } = useAuth();
+  const [advanceMode, setAdvanceMode] = useState(() => cacheGet<SettingsInfo>(CACHE_KEY)?.advance_mode ?? false);
+  const [defaultProfile, setDefaultProfile] = useState<string | null>(() => cacheGet<SettingsInfo>(CACHE_KEY)?.default_profile ?? null);
+  // Các ô Select là uncontrolled: tăng sau mỗi phản hồi settings / hồ sơ mới để remount chúng với đúng giá trị state
   // (thứ sẽ được gửi khi bấm "Lưu") — ô chọn và state không bao giờ lệch nhau.
   const [version, setVersion] = useState(0);
+  // Form hồ sơ tại chỗ cũng có Select uncontrolled: mở lại (Sửa/Mới/sau khi gieo) thì remount bằng draftKey.
+  const [draftKey, setDraftKey] = useState(0);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<ApiError | null>(null);
   const [saved, setSaved] = useState(false);
+  const [draft, setDraft] = useState<ProfileDraft | null>(null);
+  const [draftBusy, setDraftBusy] = useState(false);
+  const [draftError, setDraftError] = useState<ApiError | null>(null);
 
   // Lưu/xoá key: phần "Chế độ dịch mặc định" phản ánh server (key quyết định engine nào dùng được, server có
-  // thể đổi mặc định), không giữ lựa chọn dở dang. Font đang chọn dở thì GIỮ: key không đụng tới default_font.
+  // thể đổi mặc định, kể cả tắt Chế độ nâng cao), không giữ lựa chọn dở dang. Font đang chọn dở thì GIỮ: key không đụng tới default_font.
   const applyKeyChange = useCallback((next: SettingsInfo) => {
     cacheSet(CACHE_KEY, next);
     setSettings(next);
     setChoice(initialChoice(next));
+    setAdvanceMode(next.advance_mode);
     setVersion((current) => current + 1);
-  }, []);
+    void refreshUser(); // tab Hồ sơ dịch biến mất ngay khi xoá key Gemini làm tắt Chế độ nâng cao
+  }, [refreshUser]);
 
-  // Tải trang / lưu mặc định: mọi thứ, kể cả font, theo đúng server.
+  // Tải trang / lưu mặc định: mọi thứ, kể cả font và công tắc, theo đúng server.
   const apply = useCallback((next: SettingsInfo) => {
-    applyKeyChange(next);
+    cacheSet(CACHE_KEY, next);
+    setSettings(next);
+    setChoice(initialChoice(next));
+    setVersion((current) => current + 1);
     setFont(next.default_font);
-  }, [applyKeyChange]);
+    setAdvanceMode(next.advance_mode);
+    setDefaultProfile(next.default_profile);
+  }, []);
 
   const load = useCallback(() => {
     setLoadError(null);
@@ -183,13 +210,88 @@ export function TranslationSettingsPage() {
     setSaved(false);
     const { engine, model } = chosenEngine(choice);
     try {
-      apply(await settingsApi.savePreferences(engine, model, font));
+      apply(await settingsApi.savePreferences({
+        default_engine: engine, default_model: model, default_font: font,
+        advance_mode: choice.mode === 'ai' ? advanceMode : false, // động cơ thuần: server cũng tự tắt (spec 2026-10-15 §6)
+        default_profile: defaultProfile,
+      }));
+      await refreshUser(); // tab Hồ sơ dịch trong SettingsLayout hiện/ẩn theo me.advance_mode
       setSaved(true);
     } catch (caught) {
       setSaveError(toApiError(caught));
     } finally {
       setSaving(false);
     }
+  }
+
+  /** Chỉ cập nhật danh sách hồ sơ + bộ nhớ đệm — KHÔNG `apply` để không mất công tắc/font đang gạt dở. */
+  function mergeProfile(current: SettingsInfo, savedProfile: ProfileItem) {
+    const exists = current.profiles.some((profile) => profile.id === savedProfile.id);
+    const next = {
+      ...current,
+      profiles: exists ? current.profiles.map((profile) => (profile.id === savedProfile.id ? savedProfile : profile)) : [...current.profiles, savedProfile],
+    };
+    cacheSet(CACHE_KEY, next);
+    setSettings(next);
+  }
+
+  async function saveDraft(current: SettingsInfo) {
+    if (!draft || draftBusy) return;
+    setDraftBusy(true);
+    setDraftError(null);
+    try {
+      const body = { name: draft.name.trim(), ...draft.style };
+      const savedProfile = draft.id ? await profilesApi.update(draft.id, body) : await profilesApi.create(body);
+      mergeProfile(current, savedProfile);
+      if (!draft.id) setDefaultProfile(savedProfile.id); // Hồ sơ mới: chọn luôn làm mặc định (người dùng bấm Lưu để chốt)
+      setVersion((value) => value + 1); // ô chọn remount để hiện tên / lựa chọn mới
+      setDraft(null);
+    } catch (caught) {
+      setDraftError(toApiError(caught));
+    } finally {
+      setDraftBusy(false);
+    }
+  }
+
+  /** ✎ Sửa: hồ sơ là mẫu trong code (người chưa có dòng nào) thì gieo 5 mẫu trước rồi mở form trên đúng dòng vừa gieo. Danh sách trên
+   *  màn hình có thể đã cũ (tab khác / một GET khác đã gieo, có khi đã sửa dòng gieo): đọc lại trước — server không còn mẫu trong code
+   *  thì KHÔNG gọi khôi phục (nó đưa các dòng gieo về gốc, mất bản sửa), chỉ ánh xạ sang dòng đã gieo. */
+  async function openEdit(target: ProfileItem) {
+    if (draftBusy) return;
+    setDraftError(null);
+    setDraftKey((value) => value + 1);
+    let row = target;
+    if (target.kind === 'preset') {
+      setDraft(null);
+      setDraftBusy(true);
+      try {
+        let next = await settingsApi.get();
+        if (next.profiles.some((profile) => profile.kind === 'preset')) {
+          await profilesApi.restorePresets();
+          next = await settingsApi.get();
+        }
+        cacheSet(CACHE_KEY, next); // chỉ danh sách hồ sơ + bộ nhớ đệm, không `apply`: công tắc/font/engine chưa Lưu giữ nguyên
+        setSettings(next);
+        const seeded = findProfile(next.profiles, target.id);
+        // Đã gieo ở nơi khác rồi xoá đúng dòng của mẫu này: báo không tìm thấy (không gieo lại — sẽ đưa các dòng khác về mẫu).
+        if (!seeded || seeded.kind === 'preset') throw new ApiError(404, 'profile_not_found');
+        row = seeded;
+        setDefaultProfile(seeded.id);
+        setVersion((value) => value + 1);
+      } catch (caught) {
+        setDraftError(toApiError(caught));
+        return;
+      } finally {
+        setDraftBusy(false);
+      }
+    }
+    setDraft({ id: row.id, title: t('profiles.form.editTitle', { name: row.name }), name: row.name, style: styleOf(row) });
+  }
+
+  function openNew() {
+    setDraftError(null);
+    setDraftKey((value) => value + 1);
+    setDraft({ id: null, title: t('profiles.form.createTitle'), name: '', style: STYLE_DEFAULTS });
   }
 
   if (loadError) {
@@ -213,6 +315,8 @@ export function TranslationSettingsPage() {
   const plainEngines = settings.engines.filter((engine) => engine.mode === 'plain');
   const needsKeyHint = !geminiAvailable || plainEngines.some((engine) => engine.available === false);
   const credentialOf = (provider: Provider) => settings.credentials.find((item) => item.provider === provider);
+  const selected = findProfile(settings.profiles, defaultProfile);
+  const customCount = settings.profiles.filter((profile) => profile.kind === 'custom').length;
 
   return (
     <Box>
@@ -226,6 +330,9 @@ export function TranslationSettingsPage() {
               <Radio label={t('mode.plain')} value="plain" checked={choice.mode === 'plain'} />
               <Radio label={t('mode.ai')} value="ai" checked={choice.mode === 'ai'} disabled={!geminiAvailable} />
             </RadioGroup>
+            {choice.mode === 'plain' && settings.advance_mode && (
+              <Text fontSize={14} color="text-secondary" mt={4}>{t('settings.advance.plainTurnsOff')}</Text>
+            )}
           </Box>
           {choice.mode === 'plain' ? (
             <Box>
@@ -249,6 +356,55 @@ export function TranslationSettingsPage() {
             <Select key={`font-${version}`} id="default-font" defaultValue={font}
               options={fontOptions()} onChange={(event) => setFont(event.target.value)} />
           </FormGroup>
+          {choice.mode === 'ai' && (
+            <>
+              <Box>
+                <Toggle as="input" label={t('settings.advance.toggle')} checked={advanceMode} onChange={() => setAdvanceMode((value) => !value)} />
+                <Text fontSize={14} color="text-secondary" mt={4}>{t('settings.advance.hint')}</Text>
+                {advanceMode !== settings.advance_mode && (
+                  <Text fontSize={14} color="text-secondary" mt={4} data-testid="advance-unsaved">{t('settings.advance.unsaved')}</Text>
+                )}
+              </Box>
+              <FormGroup label={t('settings.advance.defaultProfile')} htmlFor="default-profile" isSoloField>
+                <Select key={`profile-${version}`} id="default-profile" defaultValue={defaultProfile ?? ''} options={profileOptions(settings.profiles)}
+                  disabled={!advanceMode} onChange={(event) => setDefaultProfile(event.target.value || null)} />
+              </FormGroup>
+              {advanceMode && (
+                <>
+                  <FlexBox gap={8} flexWrap="wrap">
+                    <StrokeButton type="button" size="small" onClick={() => selected && void openEdit(selected)} disabled={!selected || draftBusy}>
+                      {t('settings.advance.editProfile')}
+                    </StrokeButton>
+                    <StrokeButton type="button" size="small" onClick={openNew} disabled={customCount >= settings.profile_limit || draftBusy}>
+                      {t('settings.advance.newProfile')}
+                    </StrokeButton>
+                  </FlexBox>
+                  {(draft || draftError) && (
+                    <Box key={draftKey} border={1} borderStyle="solid" borderColor="border-tertiary" borderRadius="md" p={16} data-testid="profile-draft">
+                      {draft && (
+                        <>
+                          <Text as="h3" variant="title-xs" mb={12}>{draft.title}</Text>
+                          <ProfileFormFields idPrefix="settings-profile" name={draft.name} style={draft.style}
+                            onNameChange={(name) => setDraft({ ...draft, name })} onStyleChange={(style) => setDraft({ ...draft, style })} />
+                        </>
+                      )}
+                      {draftError && <Box mt={draft ? 12 : 0}><Alert type="error" placement="inline">{errorText(draftError.code, draftError.params)}</Alert></Box>}
+                      <FlexBox gap={8} mt={12}>
+                        {draft && (
+                          <FillButton type="button" size="small" onClick={() => void saveDraft(settings)} disabled={draftBusy || draft.name.trim() === ''}>
+                            {t('profiles.form.save')}
+                          </FillButton>
+                        )}
+                        <StrokeButton type="button" size="small" onClick={() => { setDraft(null); setDraftError(null); }} disabled={draftBusy}>
+                          {t('common.cancel')}
+                        </StrokeButton>
+                      </FlexBox>
+                    </Box>
+                  )}
+                </>
+              )}
+            </>
+          )}
           {saveError && <Alert type="error" placement="inline">{errorText(saveError.code, saveError.params)}</Alert>}
           {saved && <Alert type="success" placement="inline">{t('settings.saved')}</Alert>}
           <Box>
@@ -261,7 +417,8 @@ export function TranslationSettingsPage() {
         {PROVIDERS.map((provider) => (
           <KeyCard key={provider.id} provider={provider.id} label={engineLabel(provider.id, settings.engines)}
             description={provider.description} link={provider.link} credential={credentialOf(provider.id)}
-            defaultEngine={settings.default_engine} onChanged={applyKeyChange} />
+            defaultEngine={settings.default_engine} onChanged={applyKeyChange}
+            deleteTurnsOffAdvance={settings.advance_mode && provider.id === 'gemini' && settings.default_engine === 'gemini'} />
         ))}
       </FlexBox>
     </Box>

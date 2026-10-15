@@ -18,6 +18,8 @@ type AuthValue = {
   /** Nạp lại /api/setup/status: sau /setup, sau khi admin lưu/xoá cấu hình, sau khi xoá tài khoản; tự chạy khi apiFetch
    *  phát INSTANCE_STALE_EVENT. */
   refreshInstance: () => Promise<void>;
+  /** Nạp lại /api/auth/me — sau khi lưu công tắc Chế độ nâng cao (tab Hồ sơ dịch hiện/ẩn theo me.advance_mode). Lỗi → giữ user cũ. */
+  refreshUser: () => Promise<void>;
 };
 
 const AuthContext = createContext<AuthValue | null>(null);
@@ -57,6 +59,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setInstance(await setupApi.status().catch(() => INSTANCE_FALLBACK));
   }, []);
 
+  const refreshUser = useCallback(async () => {
+    const me = await authApi.me().catch(() => null);
+    if (me) setUser(me);
+  }, []);
+
   // Một chỗ cho mọi trang: setup_required / setup_done / registration_closed / mail_not_configured (apiFetch phát sự kiện).
   useEffect(() => {
     const refresh = () => { void refreshInstance(); };
@@ -65,8 +72,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [refreshInstance]);
 
   const value = useMemo(
-    () => ({ user, instance, loading, signedIn, signedOut, logout, refreshInstance }),
-    [user, instance, loading, signedIn, signedOut, logout, refreshInstance],
+    () => ({ user, instance, loading, signedIn, signedOut, logout, refreshInstance, refreshUser }),
+    [user, instance, loading, signedIn, signedOut, logout, refreshInstance, refreshUser],
   );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

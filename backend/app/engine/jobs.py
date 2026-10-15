@@ -21,18 +21,23 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import sessionmaker
 
 from ..db import utcnow
-from ..models import File
+from ..models import File, FileVersion
+from ..profiles.prompt import build_instructions
+from ..profiles.snapshot import load as load_snapshot
 from ..providers.catalog import ENGINE_BY_ID, PROVIDER_LABELS
 from ..providers.credentials import drop_gemini_model, load_api_key
+from ..system.store import effective_max_versions
 from .paths import file_dir, safe_name
 
 if TYPE_CHECKING:
@@ -49,6 +54,7 @@ REBUILD_DIR = "rebuild"  # dựng lại chạy trong thư mục con: bản dịc
 TABLE_FILES = ("segments.jsonl", "segments.meta.json")  # bảng đoạn đã dịch (đã trả tiền) của worker handoff
 BACKUP_NAME = ".previous"  # bản dịch cũ cất tạm trong rebuild/ lúc thay — cũng không được là tên tệp kết quả
 ERROR_LOG_NAME = "worker-stderr.log"  # stderr của worker — không được là tên tệp kết quả
+VERSIONS_DIR = "versions"  # kho bản cũ versions/<version_id>/<output_name> (spec 2026-10-14 §5) — tách khỏi rebuild/
 FONT_PROFILES = {"sans", "serif"}  # giá trị hợp lệ của dòng {"font"} — giá trị lạ không được lưu
 STAGE_MESSAGES = {
     "": "Đang dịch…",
@@ -59,6 +65,7 @@ STAGE_MESSAGES = {
 MISSING_KEY_MESSAGE = "Chưa có API key cho {provider}. Thêm key trong Cài đặt rồi bấm Dịch lại."
 NO_HANDOFF_WORKER_MESSAGE = "Thiếu cấu hình worker dịch qua API."
 MODEL_DROPPED_NOTE = " Đã gỡ model khỏi danh sách của key; model mặc định hiện là {label}."
+RESTORE_SOURCE_MISSING_MESSAGE = "Không tìm thấy tệp của bản cũ cần khôi phục."  # khôi phục mà bản nguồn (dòng / tệp) không còn
 
 
 @dataclass
@@ -68,6 +75,36 @@ class Progress:
     written_pct: int = -100
     stage: str = ""  # split|translate|render — "" với google_free
     engine_label: str = ""
+
+
+@dataclass(frozen=True)
+class Previous:
+    """Metadata của bản dịch ĐANG là bản chính — đọc trong _finish trước khi _finish_rebuild ghi đè dòng files (spec 2026-10-14 §5).
+    finished_at thường None (_claim_next đã xoá); UI dùng archived_at. translated_at/restored_from (spec 2026-10-15 §4) đi theo bản
+    khi cất."""
+
+    output_name: str | None
+    language: str
+    engine: str
+    model: str | None
+    font: str
+    font_used: str | None
+    untranslated: int
+    finished_at: datetime | None
+    config: str | None
+    version_no: int
+    translated_at: datetime | None = None
+    restored_from: int | None = None
+
+
+@dataclass(frozen=True)
+class RestoreSource:
+    """Bản nguồn của một lượt khôi phục (spec 2026-10-15 §2) — đọc từ dòng file_versions trong _execute, trước mọi lối thoát sớm."""
+
+    store: Path  # <file_dir>/versions/<vid>/
+    output_name: str
+    untranslated: int
+    font_used: str | None
 
 
 def _pct(done: int, total: int) -> int:
@@ -136,11 +173,44 @@ def _replace_tables(directory: Path, staging: Path) -> None:
             os.replace(staging / name, directory / name)
 
 
+def _copy_tables(src: Path, dst: Path) -> None:
+    """Chép các tệp TABLE_FILES có trong `src` sang `dst`. CHÉP, không chuyển: `src` giữ nguyên; tệp cùng tên ở `dst` bị ghi đè;
+    tệp không có ở `src` thì `dst` không đổi. KHÔNG nguyên tử: lỗi giữa chừng (ENOSPC) có thể để lại một phần ở `dst` rồi ném
+    ngoại lệ — người gọi lo dọn `dst`."""
+    for name in TABLE_FILES:
+        if (src / name).is_file():
+            shutil.copyfile(src / name, dst / name)
+
+
 def _rescue_backup(directory: Path, staging: Path, output_name: str | None) -> None:
     """Bản dịch cũ còn nằm trong rebuild/.previous mà thư mục job không có tệp đó (chết / lỗi giữa lúc thay) → trả lại."""
     backup = staging / BACKUP_NAME
     if output_name and backup.is_file() and not (directory / output_name).exists():
         os.replace(backup, directory / output_name)
+
+
+def _rescue_orphan_versions(directory: Path, output_name: str | None, known: frozenset[str]) -> None:
+    """versions/<x>/ KHÔNG có dòng file_versions = thao tác bị ngắt (spec 2026-10-14 §5): (a) chết giữa "cất bản cũ vào kho" và
+    commit → bản cũ chỉ còn ở đó, thư mục job thiếu output_name → trả về; (b) tỉa đã commit, rmtree chưa kịp → rác → xoá.
+    Thư mục có dòng (`known`) không đụng. Chỉ runner gọi (giữ khoá, job đang được nhận)."""
+    store = directory / VERSIONS_DIR
+    if not store.is_dir():
+        return
+    for child in store.iterdir():
+        if child.name in known or not child.is_dir() or child.is_symlink():
+            continue
+        if output_name and not (directory / output_name).exists() and (child / output_name).is_file():
+            os.replace(child / output_name, directory / output_name)
+        shutil.rmtree(child, ignore_errors=True)
+
+
+def _rescue_interrupted_swap(directory: Path, output_name: str | None, known_versions: frozenset[str]) -> None:
+    """Trả bản dịch hiện tại về thư mục job sau một lượt thay bị ngắt. THỨ TỰ có nghĩa: rebuild/.previous trước (chết giữa bước
+    1–2 của spec 2026-10-14 §5: nó CHÍNH LÀ bản hiện tại), rồi mới tới versions/<x>/ mồ côi (chết giữa bước 3–4 — lúc đó .previous
+    đã không còn). Làm ngược lại thì một thư mục mồ côi cũ (tỉa xong chưa kịp xoá) trùng tên chiếm chỗ, và .previous bị xoá theo
+    rebuild/. Gọi từ _execute (trước các lối thoát sớm) và _staging — cùng một hàm để không bao giờ lệch thứ tự."""
+    _rescue_backup(directory, directory / REBUILD_DIR, output_name)
+    _rescue_orphan_versions(directory, output_name, known_versions)
 
 
 def _tail(path: Path, lines: int = 3) -> str:
@@ -365,15 +435,37 @@ class JobRunner:
                 language, engine_id, model = row.retranslate_language, row.retranslate_engine or "", row.retranslate_model or ""
             else:
                 language, engine_id, model = row.language, row.engine, row.model or ""
+            # Chỉ dẫn văn phong của LƯỢT này (spec 2026-10-14 §4): dịch lại → snapshot đang đỗ; dựng lại font / dịch lần đầu → snapshot hiện tại.
+            config_text = row.retranslate_config if retranslating else row.config
             # Dựng lại font HOẶC dịch lại: chạy trong rebuild/, bản cũ còn nguyên tới khi thay. Dịch lại luôn có rebuild_font
             # (service ghi cùng một UPDATE) — vẫn xét cả retranslate_*: thiếu rebuild_font thì font lùi về font của tệp.
             staged = row.rebuild_font is not None or retranslating
             previous_output = row.output_name
             font = row.rebuild_font or row.font
+            # Id các bản cũ có dòng DB: thư mục versions/<x>/ ngoài danh sách là thao tác bị ngắt (_rescue_orphan_versions).
+            known_versions = (frozenset(db.scalars(select(FileVersion.id).where(FileVersion.file_id == row.id)).all())
+                              if staged else frozenset())
+            # Khôi phục bản cũ (spec 2026-10-15 §2): restore_version đi cùng retranslate_* + rebuild_font của bản nguồn (service ghi một
+            # UPDATE) nên `retranslating`/`staged` ở trên đã đúng; đọc dòng nguồn NGAY — không còn dòng thì coi như tệp nguồn mất.
+            restoring = row.restore_version is not None
+            source_version = db.get(FileVersion, row.restore_version) if restoring else None
+            restore_source = (RestoreSource(store=directory / VERSIONS_DIR / source_version.id, output_name=source_version.output_name,
+                                            untranslated=source_version.untranslated, font_used=source_version.font_used)
+                              if source_version is not None else None)
             engine = ENGINE_BY_ID.get(engine_id)
             api_key = None
-            if engine is not None and engine.provider is not None:
+            if engine is not None and engine.provider is not None and not restoring:  # khôi phục không cần key
                 api_key = load_api_key(db, self._secret_key, row.user_id, engine.provider)
+        if staged:
+            # Lượt thay trước bị ngắt → bản hiện tại có thể chỉ còn trong rebuild/.previous hoặc versions/<x>/ mồ côi. Cứu NGAY,
+            # trước mọi lối thoát sớm dưới đây (engine lạ, thiếu key, thiếu worker handoff): các lối đó đi _abort — vốn không đụng
+            # versions/ — và tệp trở lại `done` mà tải xuống 410. _staging gọi lại (không còn gì để làm).
+            _rescue_interrupted_swap(directory, previous_output, known_versions)
+        if restoring:
+            # Không worker, không key, không API: rẽ TRƯỚC kiểm engine/key/worker — người đã xoá key Gemini vẫn khôi phục được bản
+            # Gemini cũ. Outcome đi vào _finish → nhánh staged → _finish_rebuild y như một lượt dịch lại vừa xong.
+            self._finish(file_id, **self._stage_restore(directory, previous_output, known_versions, restore_source))
+            return
         if engine is None:
             self._finish(file_id, status="error", message=f"Engine dịch không được hỗ trợ: {engine_id}")
             return
@@ -393,8 +485,11 @@ class JobRunner:
                 return
             cmd = self._handoff_cmd
             # Key đi qua env, KHÔNG qua argv: `ps` của mọi user trên máy đọc được argv.
-            env.update(TRANSLATE_PROVIDER=engine.provider, TRANSLATE_API_KEY=api_key, TRANSLATE_MODEL=model)
-        output_dir = self._staging(directory, previous_output, keep_job_tables=not retranslating) if staged else directory
+            # Chỉ worker handoff nhận chỉ dẫn (động cơ thuần không có prompt); chuỗi là nội dung người dùng → đi qua env như key, không argv.
+            env.update(TRANSLATE_PROVIDER=engine.provider, TRANSLATE_API_KEY=api_key, TRANSLATE_MODEL=model,
+                       TRANSLATE_INSTRUCTIONS=build_instructions(load_snapshot(config_text), language))
+        output_dir = (self._staging(directory, previous_output, keep_job_tables=not retranslating, known_versions=known_versions)
+                      if staged else directory)
         with self._lock:
             self._progress[file_id] = Progress(engine_label=engine.label)
         try:
@@ -418,22 +513,41 @@ class JobRunner:
             return ""
         return "" if label is None else MODEL_DROPPED_NOTE.format(label=label)
 
+    def _stage_restore(self, directory: Path, previous_output: str | None, known_versions: frozenset[str],
+                       source: RestoreSource | None) -> dict:
+        """Chép bản nguồn (PDF + bảng đoạn nếu có) vào rebuild/ làm "đầu ra mới" của lượt này rồi trả outcome cho _finish (spec
+        2026-10-15 §2). _staging(keep_job_tables=False) cố ý giữ segments.* của một lượt dịch lại bị ngắt — chúng KHÔNG phải của bản
+        nguồn nên xoá trước. PDF chép sang .tmp rồi os.replace: chết giữa chừng không để lại tệp cụt mang tên kết quả (lần chạy lại
+        _staging dọn .tmp). Bản nguồn mất (dòng / tệp) → outcome lỗi → _abort: tệp về `done` với rebuild_error, kho nguyên."""
+        staging = self._staging(directory, previous_output, keep_job_tables=False, known_versions=known_versions)
+        for name in TABLE_FILES:
+            (staging / name).unlink(missing_ok=True)
+        if source is None or not (source.store / source.output_name).is_file():
+            return {"status": "error", "message": RESTORE_SOURCE_MISSING_MESSAGE}
+        temp = staging / (source.output_name + ".tmp")
+        shutil.copyfile(source.store / source.output_name, temp)
+        os.replace(temp, staging / source.output_name)
+        _copy_tables(source.store, staging)  # bảng của bản nguồn (nếu có) — _replace_tables đưa vào thư mục job sau commit
+        return {"status": "done", "message": "Xong", "output_name": source.output_name, "untranslated": source.untranslated,
+                "font_used": source.font_used}
+
     @staticmethod
-    def _staging(directory: Path, output_name: str | None = None, *, keep_job_tables: bool = True) -> Path:
+    def _staging(directory: Path, output_name: str | None = None, *, keep_job_tables: bool = True,
+                 known_versions: frozenset[str] = frozenset()) -> Path:
         """Thư mục rebuild/ cho một lượt thay bản dịch.
         keep_job_tables=True (dựng lại font): bảng dở của lượt trước (nếu dài hơn) trả về thư mục job, rồi chép bảng job vào
         staging → worker handoff dùng lại (0 lời gọi API).
         keep_job_tables=False (dịch lại từ đầu): KHÔNG chép bảng job (thuộc lựa chọn cũ) và KHÔNG trả bảng dở về job (thuộc
-        lựa chọn mới); giữ nguyên segments.* trong rebuild/ (đoạn đã trả tiền của lượt dịch lại bị ngắt), dọn mọi thứ khác."""
+        lựa chọn mới); giữ nguyên segments.* trong rebuild/ (đoạn đã trả tiền của lượt dịch lại bị ngắt), dọn mọi thứ khác.
+        `known_versions` = id file_versions của tệp — thư mục versions/<x>/ ngoài danh sách là mồ côi: có tệp đúng tên mà thư mục
+        job thiếu thì trả về, không thì xoá (_rescue_interrupted_swap)."""
         staging = directory / REBUILD_DIR
-        _rescue_backup(directory, staging, output_name)  # chết giữa lúc thay: bản cũ chỉ còn trong .previous
+        _rescue_interrupted_swap(directory, output_name, known_versions)  # .previous rồi kho mồ côi — chết giữa lúc thay / cất / tỉa
         if keep_job_tables:
             _restore_tables(directory, staging)  # đoạn đã trả tiền của lượt dựng lại bị ngắt không được mất theo
             shutil.rmtree(staging, ignore_errors=True)  # lượt dựng lại dở của lần chạy trước (restart giữa chừng)
             staging.mkdir()
-            for name in TABLE_FILES:
-                if (directory / name).is_file():
-                    shutil.copyfile(directory / name, staging / name)
+            _copy_tables(directory, staging)
             return staging
         staging.mkdir(exist_ok=True)
         for child in staging.iterdir():
@@ -587,16 +701,26 @@ class JobRunner:
             if row is None or row.status != "running":
                 return
             user_id, previous_output = row.user_id, row.output_name
-            retranslate = ((row.retranslate_language, row.retranslate_engine or "", row.retranslate_model or "")
-                           if row.retranslate_language is not None else None)
+            retranslate = ((row.retranslate_language, row.retranslate_engine or "", row.retranslate_model or "",
+                            row.retranslate_config) if row.retranslate_language is not None else None)
             staged = row.rebuild_font is not None or retranslate is not None  # cùng điều kiện với _execute
             new_font = row.rebuild_font or row.font
+            # Bản ĐANG là bản chính + hạn giữ: đọc TRƯỚC khi _finish_rebuild ghi đè dòng (spec 2026-10-14 §5).
+            previous = Previous(output_name=row.output_name, language=row.language, engine=row.engine, model=row.model, font=row.font,
+                                font_used=row.font_used, untranslated=row.untranslated, finished_at=row.finished_at,
+                                config=row.config, version_no=row.version_no, translated_at=row.translated_at,
+                                restored_from=row.restored_from)
+            max_versions = effective_max_versions(db) if retranslate is not None and status == "done" else 1
+            # Khôi phục: số của bản nguồn ghi vào files.restored_from cùng giao dịch (spec 2026-10-15 §2); dịch lại thường → None.
+            restored_from = (db.scalar(select(FileVersion.version_no).where(FileVersion.id == row.restore_version))
+                             if row.restore_version is not None else None)
         pages = {key: value for key, value in (("done_pages", done_pages), ("total_pages", total_pages))
                  if value is not None}
         if staged:
             if status == "done":
                 self._finish_rebuild(file_id, user_id, new_font, previous_output, retranslate=retranslate, message=message,
-                                     output_name=output_name, untranslated=untranslated, font_used=font_used, **pages)
+                                     output_name=output_name, untranslated=untranslated, font_used=font_used,
+                                     previous=previous, max_versions=max_versions, restored_from=restored_from, **pages)
             else:
                 self._abort(file_id, user_id, message, previous_output, retranslating=retranslate is not None)
             return
@@ -604,56 +728,116 @@ class JobRunner:
                         "untranslated": untranslated, "finished_at": utcnow(), "stage": "", **pages}
         if status == "done":
             values["font_used"] = font_used
+            values["translated_at"] = values["finished_at"]  # bản dịch vừa hoàn tất (spec 2026-10-15 §4)
         self._update_running(file_id, values)
 
     def _finish_rebuild(
         self, file_id: str, user_id: str, rebuild_font: str, previous_output: str | None, *,
-        retranslate: tuple[str, str, str] | None, message: str,
-        output_name: str | None, untranslated: int, font_used: str | None, **pages: int,
+        retranslate: tuple[str, str, str, str | None] | None, message: str,
+        output_name: str | None, untranslated: int, font_used: str | None,
+        previous: Previous | None = None, max_versions: int = 1, restored_from: int | None = None, **pages: int,
     ) -> None:
-        """Dựng lại xong: bản dịch mới (và bảng đoạn — có thể vừa được bổ sung) thay bản cũ trên đĩa, rồi mới ghi DB.
-        `rebuild_font` = font của bản mới. Dịch lại (`retranslate` = (language, engine, model) từ retranslate_*, BẮT BUỘC
-        truyền tên — None là dựng lại font): language/engine/model lấy từ đó, bảng mới thay hẳn bảng cũ."""
+        """Dựng lại / dịch lại xong: bản dịch mới (và bảng đoạn — có thể vừa được bổ sung) thay bản cũ trên đĩa, rồi mới ghi DB.
+        `rebuild_font` = font của bản mới. Dịch lại (`retranslate` = (language, engine, model, config) từ retranslate_*, BẮT
+        BUỘC truyền tên — None là dựng lại font): language/engine/model lấy từ đó, bảng mới thay hẳn bảng cũ; phần tử thứ tư =
+        snapshot của lượt dịch lại (`retranslate_config`), đổi chỗ vào `config` khi xong. Thứ tự (spec 2026-10-14 §5):
+        (1) bản cũ → rebuild/.previous; (2) bản mới vào thư mục job; (3) chỉ khi dịch lại, có bản cũ, `max_versions` > 1:
+        .previous → versions/<vid>/<tên cũ> (`previous` = metadata của nó, đọc trong _finish) + chép bảng đoạn của thư mục job vào
+        đó (_copy_tables); (4) INSERT file_versions + tỉa + UPDATE files là MỘT giao dịch (_commit_swap); (5) lỗi / dòng không còn
+        running → _put_back trả cả tệp đã cất (kèm rmtree versions/<vid>/ — bản sao bảng đi theo);
+        (6) sau commit: xoá thư mục đã tỉa, thay bảng, xoá rebuild/. Dựng lại font ghi DB qua _update_running như cũ.
+        restored_from = số của bản nguồn khi lượt này là khôi phục (_finish đọc theo restore_version), None với dịch lại thường —
+        ghi vào files.restored_from cùng giao dịch, kèm restore_version về NULL."""
         directory = file_dir(self._users_dir, user_id, file_id)
         staging = directory / REBUILD_DIR
         backup = staging / BACKUP_NAME  # bản cũ cất tạm: DB ghi hỏng thì trả lại đúng tên, tên mới trùng tên cũ cũng vậy
         moved_in = False
+        archived: Path | None = None  # versions/<vid>/<tên cũ> — đặt ngay sau mkdir: chuyển hỏng thì _put_back vẫn dọn thư mục
+        version_id = uuid.uuid4().hex[:12]
         try:
             if previous_output and (directory / previous_output).is_file():
                 os.replace(directory / previous_output, backup)
             if output_name and (staging / output_name).is_file():
                 os.replace(staging / output_name, directory / output_name)
                 moved_in = True
+            if retranslate is not None and previous is not None and previous_output and max_versions > 1 and backup.is_file():
+                store = directory / VERSIONS_DIR / version_id
+                store.mkdir(parents=True)
+                archived = store / previous_output
+                os.replace(backup, archived)  # cùng hệ tệp: đổi tên, không chép, không tốn thêm đĩa
+                # Bảng đoạn của bản cũ đi theo bản cũ (spec 2026-10-15 §3) — CHÉP: bảng ở thư mục job lúc này vẫn là của bản cũ
+                # (dịch lại / khôi phục không chép bảng job vào rebuild/, xem _staging) và thư mục job phải nguyên tới khi
+                # _replace_tables thay SAU commit. Commit hỏng → _put_back rmtree cả versions/<vid>/ nên bản sao đi theo; chép
+                # hỏng (ENOSPC) → ngoại lệ → _put_back như lỗi DB. Khôi phục bản này sau này mang bảng về → dựng lại font 0 lời gọi API.
+                _copy_tables(directory, store)
+            now = utcnow()
             values = {
                 "status": "done", "message": message[:MESSAGE_LIMIT], "output_name": output_name,
-                "untranslated": untranslated, "finished_at": utcnow(), "stage": "",
+                "untranslated": untranslated, "finished_at": now, "stage": "",
                 "font": rebuild_font, "font_used": font_used, "rebuild_font": None, **pages,
             }
             if retranslate is not None:
-                language, engine_id, model = retranslate
-                values.update(language=language, engine=engine_id, model=model or None,
-                              retranslate_language=None, retranslate_engine=None, retranslate_model=None)
-            updated = self._update_running(file_id, values)
+                language, engine_id, model, config = retranslate
+                values.update(language=language, engine=engine_id, model=model or None, config=config,
+                              retranslate_language=None, retranslate_engine=None, retranslate_model=None, retranslate_config=None,
+                              version_no=File.version_no + 1, translated_at=now, restored_from=restored_from, restore_version=None)
+                updated, pruned = self._commit_swap(file_id, values, previous if archived is not None else None, version_id,
+                                                    keep=max(0, max_versions - 1))
+            else:
+                updated, pruned = self._update_running(file_id, values), []
         except Exception:
-            self._put_back(directory, output_name, previous_output, backup, moved_in)
+            self._put_back(directory, output_name, previous_output, backup, moved_in, archived)
             raise
         if not updated:  # dòng không còn running (runner khác đã phục hồi): không đổi gì trên đĩa
-            self._put_back(directory, output_name, previous_output, backup, moved_in)
+            self._put_back(directory, output_name, previous_output, backup, moved_in, archived)
             return
+        for pruned_id in pruned:  # sau commit: thư mục của dòng đã tỉa (chết trước bước này → mồ côi, _staging lần sau dọn)
+            shutil.rmtree(directory / VERSIONS_DIR / pruned_id, ignore_errors=True)
         if retranslate is not None:
             _replace_tables(directory, staging)  # bảng của lựa chọn mới thay hẳn bảng cũ
         else:
             _restore_tables(directory, staging)
-        shutil.rmtree(staging, ignore_errors=True)  # kéo theo bản cũ đã cất — chỉ xoá sau khi DB đã trỏ sang bản mới
+        shutil.rmtree(staging, ignore_errors=True)  # kéo theo .previous (khi không cất) — chỉ xoá sau khi DB đã trỏ sang bản mới
+
+    def _commit_swap(self, file_id: str, values: dict, archive: Previous | None, version_id: str, *,
+                     keep: int) -> tuple[bool, list[str]]:
+        """MỘT giao dịch cho lượt dịch lại: UPDATE files có điều kiện (còn running), chèn dòng file_versions (khi bản cũ đã được
+        cất — `archive`), chọn + xoá các dòng vượt `keep` bản cũ (= max_versions - 1; tỉa ở MỌI lần dịch lại thành công, kể cả
+        không cất — hạ hạn về 1 vẫn dọn kho). UPDATE đi trước: rowcount 0 → rollback, không chèn dòng nào (khỏi vấp khoá ngoại
+        khi dòng đã bị xoá). Trả (đã ghi?, id các dòng đã tỉa)."""
+        with self._sessions() as db:
+            if not db.execute(update(File).where(File.id == file_id, File.status == "running").values(**values)).rowcount:
+                db.rollback()
+                return False, []
+            if archive is not None:
+                db.add(FileVersion(id=version_id, file_id=file_id, version_no=archive.version_no, language=archive.language,
+                                   engine=archive.engine, model=archive.model, font=archive.font, font_used=archive.font_used,
+                                   config=archive.config, output_name=archive.output_name or "", untranslated=archive.untranslated,
+                                   finished_at=archive.finished_at, translated_at=archive.translated_at,
+                                   restored_from=archive.restored_from, archived_at=utcnow()))
+                db.flush()
+            pruned = list(db.scalars(
+                select(FileVersion.id).where(FileVersion.file_id == file_id)
+                .order_by(FileVersion.version_no.desc(), FileVersion.archived_at.desc()).offset(keep)
+            ).all())
+            if pruned:
+                db.execute(delete(FileVersion).where(FileVersion.id.in_(pruned)))
+            db.commit()
+        return True, pruned
 
     @staticmethod
     def _put_back(directory: Path, output_name: str | None, previous_output: str | None, backup: Path,
-                  moved_in: bool) -> None:
-        """Hoàn tác phần đã làm: chỉ xoá bản mới nếu CHÍNH lần này đã chép vào, chỉ trả bản cũ nếu đã cất. Lỗi ở đây
-        không được che lỗi gốc — `_abort` còn cứu `.previous` trước khi xoá rebuild/."""
+                  moved_in: bool, archived: Path | None = None) -> None:
+        """Hoàn tác phần đã làm: chỉ xoá bản mới nếu CHÍNH lần này đã chép vào; bản cũ đã cất vào kho (`archived`) về lại
+        .previous rồi xoá thư mục versions/<vid>/ (chỉ sau khi đã lấy tệp ra); chỉ trả bản cũ nếu đã cất. Lỗi ở đây không được
+        che lỗi gốc — `_abort` còn cứu `.previous` trước khi xoá rebuild/, _staging lần sau cứu thư mục kho mồ côi."""
         try:
             if moved_in and output_name:
                 (directory / output_name).unlink(missing_ok=True)
+            if archived is not None:
+                if archived.is_file():
+                    os.replace(archived, backup)
+                shutil.rmtree(archived.parent, ignore_errors=True)
             if previous_output and backup.is_file():
                 os.replace(backup, directory / previous_output)
         except Exception:  # noqa: BLE001
@@ -663,7 +847,8 @@ class JobRunner:
                retranslating: bool = False) -> None:
         """Dựng lại thất bại — MỌI nguyên nhân (worker lỗi, đứng, quá giờ, lỗi nội bộ, thiếu key…): bản dịch cũ còn
         nguyên ở thư mục job; tệp trở lại `done` với font/untranslated cũ, lý do vào `rebuild_error`. Dịch lại thất bại
-        cũng vậy: retranslate_* về NULL, bảng cũ nguyên (không trả bảng của lựa chọn mới về job)."""
+        cũng vậy: retranslate_* về NULL, bảng cũ nguyên (không trả bảng của lựa chọn mới về job). Khôi phục thất bại (bản nguồn
+        mất, lỗi nội bộ) cũng vậy: restore_version về NULL."""
         directory = file_dir(self._users_dir, user_id, file_id)
         staging = directory / REBUILD_DIR
         _rescue_backup(directory, staging, previous_output)  # trước khi rmtree: đừng xoá bản cũ duy nhất
@@ -674,8 +859,8 @@ class JobRunner:
         shutil.rmtree(staging, ignore_errors=True)
         self._update_running(file_id, {
             "status": "done", "message": "Xong", "rebuild_font": None, "rebuild_error": reason[:MESSAGE_LIMIT],
-            "retranslate_language": None, "retranslate_engine": None, "retranslate_model": None,
-            "finished_at": utcnow(), "stage": "",
+            "retranslate_language": None, "retranslate_engine": None, "retranslate_model": None, "retranslate_config": None,
+            "restore_version": None, "finished_at": utcnow(), "stage": "",
         })
 
     def _update_running(self, file_id: str, values: dict) -> bool:

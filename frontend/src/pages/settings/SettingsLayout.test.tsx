@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { App } from '../../App';
 import { resetMetaCache } from '../../files/useMeta';
 import { t } from '../../i18n/t';
-import { ADMIN, META, SETTINGS, SIGNED_IN, SYSTEM, signedInAs } from '../../test/fixtures';
+import { ADMIN, META, SETTINGS, SIGNED_IN, SYSTEM, settingsWith, signedInAs } from '../../test/fixtures';
 import { mockApi } from '../../test/mockApi';
 import { renderApp } from '../../test/render';
 
@@ -53,5 +53,21 @@ describe('SettingsLayout', () => {
     expect(tabs().getByRole('link', { name: t('settings.tab.translation') })).toHaveAttribute('aria-current', 'page');
     expect(tabs().getByRole('link', { name: t('settings.tab.account') })).toHaveAttribute('href', '/settings/account');
     expect(meCalls()).toBe(before); // AuthProvider không gọi lại /api/auth/me: không có lượt tải lại trang
+  });
+
+  it('shows the Hồ sơ dịch tab only when advanced mode is on', async () => {
+    mockApi({ ...BASE, ...signedInAs({ advance_mode: true }), 'GET /api/settings': { body: settingsWith({ advance_mode: true }) } });
+    renderApp(<App />, { at: '/settings/profiles' });
+    expect(await screen.findByRole('heading', { name: t('profiles.title.mine') })).toBeInTheDocument();
+    expect(tabs().getByRole('link', { name: t('settings.tab.profiles') })).toHaveAttribute('aria-current', 'page');
+    expect(tabs().getAllByRole('link')).toHaveLength(3);
+  });
+
+  it('sends /settings/profiles back to the translation tab when advanced mode is off', async () => {
+    mockApi(BASE);
+    renderApp(<App />, { at: '/settings/profiles' });
+    expect(await screen.findByRole('heading', { name: t('settings.mode.title') })).toBeInTheDocument();
+    expect(screen.getByTestId('location')).toHaveTextContent(/^\/settings\/translation$/);
+    expect(tabs().queryByRole('link', { name: t('settings.tab.profiles') })).not.toBeInTheDocument();
   });
 });

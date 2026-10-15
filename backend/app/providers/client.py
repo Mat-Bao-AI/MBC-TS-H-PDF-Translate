@@ -72,6 +72,14 @@ SYSTEM_PROMPT = (
 )
 
 
+def system_instruction(language: str, instructions: str = "") -> str:
+    """systemInstruction của Gemini: SYSTEM_PROMPT (luật định dạng) rồi chỉ dẫn văn phong (spec 2026-10-14 §4) nếu có.
+    Không có chỉ dẫn → y hệt trước đây. Chỉ SYSTEM_PROMPT đi qua str.format: chỉ dẫn chứa văn bản tự do của người
+    dùng (có thể có "{", "{language}"…) nên được nối nguyên văn SAU khi format, không bao giờ format phần ghép."""
+    prompt = SYSTEM_PROMPT.format(language=language)
+    return f"{prompt}\n\n{instructions}" if instructions else prompt
+
+
 def _stderr(line: str) -> None:
     sys.stderr.write(line + "\n")
     sys.stderr.flush()
@@ -345,10 +353,12 @@ class _Client:
     dừng mọi lô khi gặp lỗi chết người."""
 
     def __init__(self, api_key: str, model: str, target_language: str, transport: Transport,
-                 sleep: Callable[[float], None] | None, clock: Callable[[], float], log: Callable[[str], None]) -> None:
+                 sleep: Callable[[float], None] | None, clock: Callable[[], float], log: Callable[[str], None],
+                 instructions: str = "") -> None:
         self.api_key, self.model, self.transport, self.clock, self.log = api_key, model, transport, clock, log
         self.language_code = target_language
         self.language = ENGLISH_NAMES.get(target_language, target_language)
+        self.instructions = instructions  # chỉ dẫn văn phong (chỉ _Gemini dùng); nội dung người dùng — không ghi log
         self.abort = threading.Event()
         self.gate = _Gate(PARALLEL, self.abort)
         # Mặc định chờ trên cờ abort: một lô khác hỏng chết người thì lần chờ (tới 60 s) dừng ngay.
@@ -436,7 +446,7 @@ class _Gemini(_Client):
 
     def _request(self, segments: list[str]) -> list | None:
         body = {
-            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT.format(language=self.language)}]},
+            "systemInstruction": {"parts": [{"text": system_instruction(self.language, self.instructions)}]},
             "contents": [{"role": "user", "parts": [{"text": json.dumps(segments, ensure_ascii=False)}]}],
             "generationConfig": self._generation_config(),
         }
@@ -487,12 +497,13 @@ def translate_segments(
     transport: Transport, on_progress: Callable[[int, int], None] | None = None,
     on_batch: Callable[[dict[str, str]], None] | None = None,
     sleep: Callable[[float], None] | None = None, clock: Callable[[], float] = time.monotonic,
-    log: Callable[[str], None] = _stderr,
+    log: Callable[[str], None] = _stderr, instructions: str = "",
 ) -> dict[str, str]:
     """Dịch `segments` → {src: dst} cho các đoạn dịch được. `on_batch` nhận bảng của từng lô ngay khi lô
     đó xong (để người gọi ghi lại phần đã trả tiền). Ném ProviderError khi gặp lỗi chết người (các lô
-    khác dừng theo) — nhưng lô nào đã xong vẫn được giao qua `on_batch` trước khi ném."""
-    client = _CLIENTS[provider](api_key, model, target_language, transport, sleep, clock, log)
+    khác dừng theo) — nhưng lô nào đã xong vẫn được giao qua `on_batch` trước khi ném.
+    `instructions` (chỉ Gemini dùng; Cloud Translation bỏ qua) nối sau SYSTEM_PROMPT — xem system_instruction."""
+    client = _CLIENTS[provider](api_key, model, target_language, transport, sleep, clock, log, instructions)
     batches = make_batches(segments)
     total, done = len(segments), 0
     table: dict[str, str] = {}

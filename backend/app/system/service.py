@@ -15,12 +15,13 @@ from ..db import utcnow
 from ..errors import ApiError
 from ..models import InstanceSettings, User
 from .mail import resolve_mail
-from .store import SMTP_SECURITIES, instance_row, open_smtp_password, seal_smtp_password, site_url
+from .store import DEFAULT_MAX_VERSIONS, SMTP_SECURITIES, instance_row, open_smtp_password, seal_smtp_password, site_url
 
 log = logging.getLogger("system")
 
 HOST_MAX, USERNAME_MAX, FROM_MAX = 253, 254, 254
 LIMIT_MIN, LIMIT_MAX = 1, 100
+VERSIONS_MIN, VERSIONS_MAX = 1, 10
 REASON_MAX = 200
 TEST_SUBJECT = "Thư thử từ PDF Translate"  # nháp — BA duyệt
 TEST_BODY = "Chào bạn,\n\nĐây là thư thử từ PDF Translate. Nhận được thư này nghĩa là cấu hình SMTP đã đúng.\n"
@@ -95,6 +96,7 @@ def settings_payload(db: Session, settings: Settings, injected: Mailer | None) -
     url, url_source = site_url(db, settings)  # chỉ đọc: đổi bằng env APP_BASE_URL, không có ô sửa
     return {"smtp": smtp_payload(db, settings, injected), "registration_open": row.registration_open,
             "max_pending_per_user": row.max_pending_per_user, "max_pending_default": settings.max_pending_per_user,
+            "max_versions": row.max_versions, "max_versions_default": DEFAULT_MAX_VERSIONS,
             "site_url": url, "site_url_source": url_source}
 
 
@@ -118,11 +120,15 @@ def _password_for(settings: Settings, row: InstanceSettings, given: SmtpInput) -
 
 
 def update_settings(db: Session, settings: Settings, injected: Mailer | None, *, smtp: dict | None,
-                    registration_open: bool | None, max_pending: object, max_pending_set: bool) -> dict:
+                    registration_open: bool | None, max_pending: object, max_pending_set: bool,
+                    max_versions: object = None, max_versions_set: bool = False) -> dict:
     """Trường bỏ qua = giữ nguyên. Kiểm HẾT rồi mới ghi: một ô sai thì cả thẻ không đổi gì."""
     if max_pending_set and max_pending is not None and (
             isinstance(max_pending, bool) or not isinstance(max_pending, int) or not LIMIT_MIN <= max_pending <= LIMIT_MAX):
         raise ApiError(422, "invalid_limit")
+    if max_versions_set and max_versions is not None and (
+            isinstance(max_versions, bool) or not isinstance(max_versions, int) or not VERSIONS_MIN <= max_versions <= VERSIONS_MAX):
+        raise ApiError(422, "invalid_max_versions")
     row = instance_row(db)
     if smtp is not None:
         given = clean_smtp(smtp)
@@ -136,6 +142,8 @@ def update_settings(db: Session, settings: Settings, injected: Mailer | None, *,
         row.registration_open = registration_open
     if max_pending_set:
         row.max_pending_per_user = max_pending
+    if max_versions_set:
+        row.max_versions = max_versions
     row.updated_at = utcnow()
     db.commit()
     return settings_payload(db, settings, injected)

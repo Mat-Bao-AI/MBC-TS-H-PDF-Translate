@@ -34,13 +34,26 @@ Cài đặt › Tài khoản (`/settings/account`): đổi tên hiển thị, đ
 `Không chân (Liberation Sans)` / `Có chân (Liberation Serif)` — xem "Font bản dịch" trong [DEPLOY.md](DEPLOY.md)
 (kể cả bước `scripts/font-render-check.py` bắt buộc mỗi lần nâng pin upstream).
 
+Chế độ nâng cao (Cài đặt › Dịch thuật, mỗi người tự bật, mặc định tắt): tab **Hồ sơ dịch** (`/settings/profiles`, 5 mẫu trong
+`backend/app/profiles/presets.py` + tối đa 20 hồ sơ riêng); khi tải lên / dịch lại bằng Gemini chọn hồ sơ, tuỳ chỉnh riêng cho tài
+liệu và điền ngữ cảnh — `backend/app/profiles/prompt.py` dựng chỉ dẫn tiếng Anh nối sau `SYSTEM_PROMPT`, runner đưa qua env
+`TRANSLATE_INSTRUCTIONS` cho `handoff_worker.py`, SHA-256 vào `segments.meta.json`. Mỗi bản dịch mang ảnh chụp cấu hình
+(`files.config`, JSON); dịch lại thành công thì bản cũ thành một phiên bản (`file_versions`, `versions/<id>/` trong thư mục tệp),
+xem/tải ở trang chi tiết; admin đặt số bản giữ lại ở Cài đặt › Hệ thống. Google miễn phí / Cloud Translation không nhận hồ sơ.
+
+Đợt 1b của Chế độ nâng cao: trang **Phiên bản** (`/files/:id/versions`) với thanh mốc, hai bản cạnh nhau (cấu hình + PDF) và **Khôi phục**
+(`POST /api/files/{id}/versions/{vid}/restore` — một job của runner CHÉP bản cũ thành bản mới nhất, không gọi API; bảng đoạn đi theo từng
+bản trong `versions/<id>/`); lần đầu bật chế độ, 5 mẫu được **gieo thành hồ sơ của chính người dùng** (`translation_profiles.preset_slug`,
+nhãn "Từ mẫu"; `POST /api/profiles/restore-presets` đưa về gốc); sửa/tạo hồ sơ ngay tại ô chọn ở Cài đặt và trong hộp tải lên / dịch
+lại; động cơ mặc định là thuần thì server tự tắt Chế độ nâng cao (cả khi xoá key Gemini hay Google gỡ model cuối).
+
 ## Kiểm thử
 
-    cd backend && .venv/bin/pytest -q --cov=app   # 2026-10-08: 693 passed, 3 skipped (327 s)
-    cd frontend && npx vitest run --testTimeout=20000 && npx tsc -p .   # 2026-10-08: 314 passed — cờ --testTimeout bắt buộc, xem ghi chú dưới
-    cd e2e && npx playwright test               # cần stack docker đang chạy, xem dưới; lần chạy cuối 2026-10-08: 1 passed (1,3 phút, có kiểm Content-Type font/woff2)
+    cd backend && .venv/bin/pytest -q --cov=app   # 2026-10-15: 850 passed, 3 skipped (903 s), coverage TOTAL 96% (đợt 1b)
+    cd frontend && npx vitest run --testTimeout=20000 && npx tsc --noEmit -p .   # 2026-10-15: 426 passed (40 tệp; chạy với --testTimeout=60000 vì máy dùng chung tải nặng) — 20000 là mức tối thiểu, xem ghi chú dưới
+    cd e2e && npx playwright test               # cần stack docker đang chạy, xem dưới; lần chạy cuối 2026-10-08: 1 passed (1,3 phút, có kiểm Content-Type font/woff2); đợt Chế độ nâng cao đợt 1; đợt 1b (2026-10-15): CHƯA VERIFY — xem TEST_LOG.md, mục E2E, dòng 2026-10-15
 
-Ghi chú: `--testTimeout=20000` là bắt buộc. Với ngưỡng mặc định 5000 ms, `FileDetailPage.test.tsx` › "retranslates a done file from a dialog prefilled…" quá hạn (`Test timed out in 5000ms`, cả khi chạy riêng một tệp) trên máy đang tải nặng (load average 5–9, có tiến trình dựng image chạy song song, 2026-10-08). Với 20000 ms cả 314 test qua. Chưa rõ test chậm cố hữu hay do tải.
+Ghi chú: `--testTimeout=20000` là mức tối thiểu — trên máy dùng chung đang tải nặng hãy đặt cao hơn (vd `--testTimeout=60000`, như lần chạy 2026-10-15 cho 426 test). Với ngưỡng mặc định 5000 ms, `FileDetailPage.test.tsx` › "retranslates a done file from a dialog prefilled…" quá hạn (`Test timed out in 5000ms`, cả khi chạy riêng một tệp) trên máy đang tải nặng (load average 5–9, có tiến trình dựng image chạy song song, 2026-10-08). Với 20000 ms cả 377 test qua (lần chạy 2026-10-15). Chưa rõ test chậm cố hữu hay do tải.
 
 ## Chạy bằng Docker
 

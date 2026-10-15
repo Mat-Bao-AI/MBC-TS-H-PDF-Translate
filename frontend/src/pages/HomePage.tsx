@@ -4,7 +4,7 @@ import { Alert, Anchor, Box, Dialog, FillButton, FlexBox, Input, Pagination, Str
 import { PdfIcon, SearchIcon } from '@codecademy/gamut-icons';
 import { toApiError } from '../api/client';
 import {
-  PAGE_SIZE, filesApi, type BulkRetranslateResult, type BulkSelection, type FileItem, type RetranslateChoice, type SortDir, type SortKey,
+  PAGE_SIZE, filesApi, type BulkRetranslateResult, type BulkSelection, type FileItem, type RetranslateRequest, type SortDir, type SortKey,
 } from '../api/files';
 import { useAuth } from '../auth/AuthContext';
 import { shortName } from '../auth/identity';
@@ -184,7 +184,7 @@ export function HomePage() {
     }
   }
 
-  async function confirmRetranslate(target: RetranslateTarget, settings: RetranslateChoice | null) {
+  async function confirmRetranslate(target: RetranslateTarget, settings: RetranslateRequest | null) {
     if (bulkRunning.current) return; // chống bấm đúp — dùng chung cờ với xoá hàng loạt
     bulkRunning.current = true;
     setActionError(null);
@@ -194,7 +194,9 @@ export function HomePage() {
         if (settings) await filesApi.retranslate(target.item.id, settings); // hộp đơn luôn trả đủ bốn lựa chọn
       } else {
         const selection: BulkSelection = allMatching ? { all: true, q } : { ids: selectedIds };
-        const result = await filesApi.bulkRetranslate({ ...selection, settings });
+        // Hàng loạt chỉ nhận bốn trường (server 422 nếu có thêm).
+        const shared = settings ? { language: settings.language, engine: settings.engine, model: settings.model, font: settings.font } : null;
+        const result = await filesApi.bulkRetranslate({ ...selection, settings: shared });
         clearSelection();
         setNotice(retranslateNotice(result));
       }

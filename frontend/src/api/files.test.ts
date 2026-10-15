@@ -36,3 +36,28 @@ describe('filesApi.retranslate / bulkRetranslate', () => {
     ]);
   });
 });
+
+describe('filesApi.upload advanced fields', () => {
+  const pdf = new File(['%PDF'], 'a.pdf', { type: 'application/pdf' });
+  const sent = async (advanced: Parameters<typeof filesApi.upload>[5]) => {
+    const { calls } = mockApi({ 'POST /api/files': { status: 202, body: {} } });
+    await filesApi.upload(pdf, 'vi', 'gemini', 'gemini-3.8-flash', 'auto', advanced);
+    return calls[0].body as FormData;
+  };
+
+  it('appends profile, style and context only when they carry a value', async () => {
+    const form = await sent({ profile: 'preset:technical', style: { tone: 'simple' }, context: 'Hợp đồng thuê nhà' });
+    expect(form.get('profile')).toBe('preset:technical');
+    expect(JSON.parse(String(form.get('style')))).toEqual({ tone: 'simple' });
+    expect(form.get('context')).toBe('Hợp đồng thuê nhà');
+  });
+
+  it('never sends an empty style: the backend reads style={} as "an advanced field was sent"', async () => {
+    for (const advanced of [null, undefined, { profile: null, style: null, context: null }, { profile: '', style: {}, context: '   ' }]) {
+      const form = await sent(advanced);
+      expect([...form.keys()]).not.toContain('style');
+      expect([...form.keys()]).not.toContain('profile');
+      expect([...form.keys()]).not.toContain('context');
+    }
+  });
+});

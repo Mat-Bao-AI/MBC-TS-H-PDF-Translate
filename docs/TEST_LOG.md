@@ -55,6 +55,12 @@ review vòng 1.
 |---|---|---|
 | 2026-10-08 | `cd backend && .venv/bin/pytest -q --cov=app` | 693 passed, 3 skipped (327 s) |
 | 2026-10-08 | `cd frontend && npx vitest run --testTimeout=20000 && npx tsc -p .` | 314 passed; `tsc` sạch. Cờ `--testTimeout=20000` bắt buộc: ngưỡng mặc định 5000 ms làm `FileDetailPage.test.tsx` quá hạn trên máy đang tải nặng |
+| 2026-10-15 | `cd backend && .venv/bin/pytest -q` | 803 passed, 3 skipped (419 s) — đợt Chế độ nâng cao đợt 1 |
+| 2026-10-15 | `cd frontend && npx vitest run --testTimeout=20000 && npx tsc --noEmit -p .` | 353 passed (36 tệp, 117 s); `tsc` sạch; đầu ra không có "Warning" / "console.error" / "not wrapped in act" |
+| 2026-10-15 | `cd backend && .venv/bin/pytest -q --cov=app` (sau đợt sửa của review tổng, Chế độ nâng cao đợt 1) | 806 passed, 3 skipped (562,54 s); coverage `app` TOTAL 96% (3495 câu lệnh, 132 chưa chạy) |
+| 2026-10-15 | `cd frontend && npx vitest run --testTimeout=20000 && npx tsc --noEmit -p .` (sau đợt sửa của review tổng) | 377 passed (36 tệp, 112,52 s); `tsc` sạch; đầu ra không có "Warning" / "console.error" / "not wrapped in act" |
+| 2026-10-15 | `cd backend && .venv/bin/pytest -q --cov=app` | 850 passed, 3 skipped (903,31 s); coverage `app` TOTAL 96% (3639 câu lệnh, 132 chưa phủ) — đợt Chế độ nâng cao đợt 1b |
+| 2026-10-15 | `cd frontend && npx vitest run --testTimeout=60000 && npx tsc --noEmit -p .` | 426 passed (40 tệp, 208 s); `tsc` sạch; đầu ra không có "Warning" / "console.error" / "not wrapped in act" (0 dòng). Dùng `--testTimeout=60000` vì máy dùng chung tải nặng (load average 17–22); lệnh ghi trong DEVELOPMENT.md giữ 20000. Lần chạy đầu cùng ngày (load ~10–16) đỏ 1 test: `FileDetailPage.test.tsx` › "retranslates a done file from a dialog prefilled with its choices and keeps the old translation meanwhile" quá 30 s; chạy riêng tệp đó 28 passed, chạy lại toàn bộ 426/426. Không sửa test. Nếu `HomePage.selection` ("clears the selection when the page, the filter or the sort changes") quá hạn lúc máy tải: nó qua khi chạy riêng. |
 | 2026-10-03 → 2026-10-08 | test cần PyMuPDF chạy trong image (`pytest` trong container, không có trong `backend/.venv`) | 62 passed (lần ghi 2026-10-06) |
 
 ## E2E (Playwright, container thật, DB trống, worker dịch giả)
@@ -72,6 +78,8 @@ mở đăng ký, sống qua restart, bố cục 360 px, và kiểm trang không 
 | 2026-10-07 | `1 passed` (≈ 1,2–1,3 phút) trên image user thường |
 | 2026-10-08 | `1 passed` (≈ 1,3 phút) sau review vòng 1, có kiểm Content-Type font/woff2 |
 | 2026-10-08 (sau khi dọn dữ liệu nội bộ) | `1 passed` (1,3 phút) với tệp mẫu `e2e/fixtures/sample-2p.pdf` mới (PDF tổng hợp sinh bởi `e2e/fixtures/make_sample_pdf.py`); `backend` 693 passed, 3 skipped (`pytest -q -W error::ResourceWarning`, 334 s); `frontend` 314 passed + `tsc` sạch |
+| 2026-10-15 | **CHƯA VERIFY** cho đợt Chế độ nâng cao đợt 1: không chạy E2E. Image `vi-translate-saas:e2e` duy nhất có sẵn dựng trước nhánh này 7 ngày (không chứa mã mới) và đĩa `/` chỉ còn ~500 MB nên không dựng lại được; không dùng docker. Cần kiểm ở lần dựng image kế tiếp: đường chính (golden path) + dịch lại bằng Gemini tạo "Bản 2" có hồ sơ, bằng key thật |
+| 2026-10-15 | **CHƯA VERIFY** cho đợt Chế độ nâng cao đợt 1b (khôi phục phiên bản, gieo hồ sơ, thuần ⇒ tắt): chưa dựng image mới cho đợt này, không chạy docker. Cần kiểm ở lần dựng image kế tiếp: khôi phục một bản cũ trên demo, dựng lại font sau khôi phục (0 lời gọi API), bật chế độ lần đầu thấy 5 hồ sơ "Từ mẫu" |
 
 ## Dịch thật (engine thật)
 
@@ -80,8 +88,13 @@ mở đăng ký, sống qua restart, bố cục 360 px, và kiểm trang không 
 | `google_free` | **CHƯA TỪNG CHẠY ĐƯỢC** đầu-cuối: Google trả 429 + trang captcha cho IP egress dùng chung của máy thử, xác nhận bằng `curl` từ cả máy chủ lẫn container, thử lại 3 lần thật trong ~20 phút (`MEASUREMENTS.md`) |
 | `gemini`, `google_cloud` | **CHƯA VERIFY** với khoá thật: toàn bộ test dùng transport giả |
 
+Đợt Chế độ nâng cao đợt 1b (2026-10-15): **CHƯA VERIFY** khôi phục với tệp thật và dịch thật bằng key Gemini với hồ sơ — test dùng transport giả (`FakeTransport`) và worker giả (`fake_worker.py`, `fake_handoff_worker.py`).
+
 ## Chưa chạy trên nền tảng thật
 
 Chưa có lượt triển khai nào trên Vibe Host hay PaaS bên ngoài: reverse proxy thật, `X-Forwarded-Proto` / `X-Forwarded-For`, giới
 hạn thân yêu cầu, gắn ổ bền vào `/data`, `--cpus` (CFS) đều **CHƯA CHẠY**. Các bước kiểm cần chạy ở đó: "Kiểm sau khi triển khai"
 trong [DEPLOY.md](DEPLOY.md).
+
+Đợt Chế độ nâng cao đợt 1 (2026-10-15): **CHƯA VERIFY** dịch thật bằng key Gemini với hồ sơ / ngữ cảnh — mọi test dùng transport giả
+(`FakeTransport`), chưa từng gọi Gemini thật với chỉ dẫn hồ sơ.

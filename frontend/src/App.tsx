@@ -1,14 +1,16 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
-import { AdminOnly, GuestOnly, RequireAuth, SetupGate } from './auth/RequireAuth';
+import { AdminOnly, AdvanceOnly, GuestOnly, RequireAuth, SetupGate } from './auth/RequireAuth';
 import { AppShell } from './components/AppShell';
 import { ConfirmEmailPage } from './pages/ConfirmEmailPage';
 import { FileDetailPage } from './pages/FileDetailPage';
+import { FileVersionsPage } from './pages/FileVersionsPage';
 import { ForgotPasswordPage } from './pages/ForgotPasswordPage';
 import { HomePage } from './pages/HomePage';
 import { LoginPage } from './pages/LoginPage';
 import { RegisterPage } from './pages/RegisterPage';
 import { ResetPasswordPage } from './pages/ResetPasswordPage';
 import { AccountSettingsPage } from './pages/settings/AccountSettingsPage';
+import { ProfilesSettingsPage } from './pages/settings/ProfilesSettingsPage';
 import { SettingsLayout } from './pages/settings/SettingsLayout';
 import { SystemSettingsPage } from './pages/settings/SystemSettingsPage';
 import { TranslationSettingsPage } from './pages/settings/TranslationSettingsPage';
@@ -28,10 +30,12 @@ export function App() {
       <Route element={<RequireAuth><AppShell /></RequireAuth>}>
         <Route path="/" element={<HomePage />} />
         <Route path="/files/:id" element={<FileDetailPage />} />
+        <Route path="/files/:id/versions" element={<FileVersionsPage />} />
         <Route path="/settings" element={<SettingsLayout />}>
           <Route index element={<Navigate to="/settings/account" replace />} />
           <Route path="account" element={<AccountSettingsPage />} />
           <Route path="translation" element={<TranslationSettingsPage />} />
+          <Route path="profiles" element={<AdvanceOnly><ProfilesSettingsPage /></AdvanceOnly>} />
           <Route path="system" element={<AdminOnly><SystemSettingsPage /></AdminOnly>} />
           <Route path="*" element={<Navigate to="/settings/account" replace />} />
         </Route>

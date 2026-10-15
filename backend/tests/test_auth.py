@@ -109,7 +109,7 @@ def test_register_looks_identical_for_free_and_taken_addresses(client, sign_up):
 def test_verify_in_the_same_browser_signs_in_and_clears_the_nonce(client, mailer):
     register(client, "an@example.com")
     response = client.post("/api/auth/verify-email", json={"token": token_in(mailer.last_to("an@example.com"))})
-    assert response.status_code == 200 and set(response.json()) == {"id", "email", "display_name", "is_admin", "smtp_notice_dismissed"}
+    assert response.status_code == 200 and set(response.json()) == {"id", "email", "display_name", "is_admin", "smtp_notice_dismissed", "advance_mode"}
     cookies = response.headers.get_list("set-cookie")
     assert any(c.startswith("session=") for c in cookies)
     cleared = [c.lower() for c in cookies if c.startswith("verify_nonce=")]
@@ -418,7 +418,7 @@ def test_me_includes_the_display_name(client, sign_up):
     me = sign_up("an@example.com")
     assert (me["display_name"], me["is_admin"]) == (None, False)
     assert client.get("/api/auth/me").json() == {"id": me["id"], "email": "an@example.com", "display_name": None, "is_admin": False,
-                                                    "smtp_notice_dismissed": False}
+                                                    "smtp_notice_dismissed": False, "advance_mode": False}
 
 
 def test_me_requires_a_session(client):

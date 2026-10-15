@@ -1,6 +1,6 @@
 import { apiFetch, jsonBody } from './client';
 
-export type Me = { id: string; email: string; display_name: string | null; is_admin: boolean; smtp_notice_dismissed: boolean };
+export type Me = { id: string; email: string; display_name: string | null; is_admin: boolean; smtp_notice_dismissed: boolean; advance_mode: boolean };
 /** Xác nhận email từ trình duyệt khác với trình duyệt đã xin link: email đã xác nhận, nhưng KHÔNG đăng nhập. */
 export type Verified = { status: 'verified' };
 type Accepted = { status: 'accepted' };

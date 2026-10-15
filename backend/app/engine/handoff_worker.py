@@ -8,15 +8,17 @@ các đoạn bằng app.providers.client. Giao thức stdout như worker.py, c�
     {"stage": "split"|"translate"|"render", "p": n, "t": m}
     {"ok": true, "output": "<đường dẫn>", "untranslated": <số>}
     {"ok": false, "error": "<thông điệp>", "code": <một khoá của ERROR_MESSAGES>}
-Key + provider + model tới qua env TRANSLATE_PROVIDER / TRANSLATE_API_KEY / TRANSLATE_MODEL, hồ sơ font qua
-TRANSLATE_FONT (auto|sans|serif, xem app.engine.fonts) —
-không qua argv (ps đọc được), và không bao giờ được in ra. Lỗi nhà cung cấp → đúng MỘT dòng chẩn đoán
+Key + provider + model + chỉ dẫn văn phong tới qua env TRANSLATE_PROVIDER / TRANSLATE_API_KEY / TRANSLATE_MODEL /
+TRANSLATE_INSTRUCTIONS (chuỗi tiếng Anh do runner dựng, chỉ Gemini dùng; sha256 của nó vào segments.meta.json), hồ sơ
+font qua TRANSLATE_FONT (auto|sans|serif, xem app.engine.fonts) — không qua argv (ps đọc được), và không bao giờ
+được in ra (chỉ dẫn là nội dung người dùng: cũng không ra log/stderr). Lỗi nhà cung cấp → đúng MỘT dòng chẩn đoán
 ra stderr: `provider=… http=… status=… reason=…` (mã của Google, không thân lỗi, không key).
 Lỗi ở bước font → đúng một dòng `font_profile code=… detail=…` (xem app.engine.fonts.FontProfileError).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -89,13 +91,21 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(temp, path)
 
 
+def instructions_digest(instructions: str) -> str:
+    """Dấu vân tay chỉ dẫn trong segments.meta.json: "" khi không có (meta trước 2026-10-14 không có khoá này = "")."""
+    return hashlib.sha256(instructions.encode("utf-8")).hexdigest() if instructions else ""
+
+
 def _resume(table_path: Path, meta_path: Path, meta: dict, segments: list[str]) -> dict[str, str]:
-    """Bảng đã dịch (đã trả tiền) của lần chạy trước — chỉ dùng lại khi cùng provider/model/ngôn ngữ.
+    """Bảng đã dịch (đã trả tiền) của lần chạy trước — chỉ dùng lại khi cùng provider/model/ngôn ngữ/chỉ dẫn.
     Viết lại tệp bảng cho sạch (bỏ dòng dở dang do worker bị giết giữa lúc ghi, bỏ đoạn không còn trong
     tài liệu) TRƯỚC khi ghi meta: trên đĩa, bảng không bao giờ đi kèm meta của một lựa chọn khác."""
     previous: dict[str, str] = {}
     try:
-        if json.loads(meta_path.read_text(encoding="utf-8")) == meta:
+        recorded = json.loads(meta_path.read_text(encoding="utf-8"))
+        if isinstance(recorded, dict):
+            recorded.setdefault("instructions", "")  # meta cũ không có khoá: nghĩa là "không có chỉ dẫn" — không được bỏ bảng
+        if recorded == meta:
             for line in table_path.read_text(encoding="utf-8").splitlines():
                 try:
                     record = json.loads(line)
@@ -116,7 +126,7 @@ def _resume(table_path: Path, meta_path: Path, meta: dict, segments: list[str]) 
 def run(source: Path, output_dir: Path, language: str, *, provider: str, api_key: str, model: str,
         translate_pdf, translate, emit: Callable[[dict], None], diagnose: Callable[[str], None] = _stderr,
         font: str = "auto", prepare: Callable[..., str] | None = None,
-        subset: Callable[[Path], object] | None = None) -> int:
+        subset: Callable[[Path], object] | None = None, instructions: str = "") -> int:
     segments_out = output_dir / "segments-out.jsonl"
     segments_in = output_dir / "segments.jsonl"
     meta_path = output_dir / "segments.meta.json"
@@ -138,8 +148,9 @@ def run(source: Path, output_dir: Path, language: str, *, provider: str, api_key
         # 2. translate: dịch bằng nhà cung cấp; đoạn không dịch được thì không vào bảng (lõi giữ nguyên văn).
         # Mỗi lô xong được ghi ngay (flush) vào segments.jsonl: job hỏng giữa chừng / bị giết thì phần đã
         # trả tiền còn đó, "Dịch lại" tệp lỗi (tại chỗ — _queue_retranslate / _recover không xoá tệp này) với cùng
-        # provider/model/ngôn ngữ chỉ dịch phần còn thiếu (_resume).
-        meta = {"provider": provider, "model": model, "target_language": language}
+        # provider/model/ngôn ngữ/chỉ dẫn chỉ dịch phần còn thiếu (_resume). Chỉ dẫn vào meta dưới dạng sha256.
+        meta = {"provider": provider, "model": model, "target_language": language,
+                "instructions": instructions_digest(instructions)}
         table = _resume(segments_in, meta_path, meta, segments)
         missing = [src for src in segments if src not in table]
         if segments:
@@ -160,7 +171,7 @@ def run(source: Path, output_dir: Path, language: str, *, provider: str, api_key
                         stream.write("".join(_line(src, dst) for src, dst in fresh.items()))
                         stream.flush()
 
-                    keep(translate(provider, api_key, model, language, missing, on_progress, keep))
+                    keep(translate(provider, api_key, model, language, missing, on_progress, keep, instructions=instructions))
         # 3. render: lượt 2 với bảng đã dịch, kết quả như worker.py.
         result = translate_pdf(source, output_dir, target_language=language, overwrite=True, engine="handoff",
                                segments=segments_in, on_progress=_progress(emit, "render"))
@@ -190,6 +201,7 @@ def main() -> int:
     provider = os.environ.get("TRANSLATE_PROVIDER", "")
     api_key = os.environ.get("TRANSLATE_API_KEY", "")
     model = os.environ.get("TRANSLATE_MODEL", "")
+    instructions = os.environ.get("TRANSLATE_INSTRUCTIONS", "")
     if not provider or not api_key:
         emit_line({"ok": False, "error": "Thiếu TRANSLATE_PROVIDER / TRANSLATE_API_KEY trong môi trường của worker."})
         return 2
@@ -201,13 +213,14 @@ def main() -> int:
         return 2
     from app.providers.client import RequestsTransport, translate_segments
 
-    def translate(provider_, api_key_, model_, language_, segments, on_progress, on_batch):
-        return translate_segments(provider_, api_key_, model_, language_, segments,
-                                  transport=RequestsTransport(), on_progress=on_progress, on_batch=on_batch)
+    def translate(provider_, api_key_, model_, language_, segments, on_progress, on_batch, instructions=""):
+        return translate_segments(provider_, api_key_, model_, language_, segments, transport=RequestsTransport(),
+                                  on_progress=on_progress, on_batch=on_batch, instructions=instructions)
 
     return run(source, output_dir, language, provider=provider, api_key=api_key, model=model,
                translate_pdf=translate_pdf, translate=translate, emit=emit_line,
-               font=os.environ.get("TRANSLATE_FONT", "auto"), prepare=fonts.prepare, subset=fonts.subset_pdf)
+               font=os.environ.get("TRANSLATE_FONT", "auto"), prepare=fonts.prepare, subset=fonts.subset_pdf,
+               instructions=instructions)
 
 
 if __name__ == "__main__":

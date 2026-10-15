@@ -1,4 +1,4 @@
-import { act, cleanup, screen, within } from '@testing-library/react';
+import { act, cleanup, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -210,7 +210,7 @@ describe('SystemSettingsPage', () => {
     await user.type(screen.getByLabelText(t('system.limit.label')), '7');
     await user.click(regCard().getByRole('button', { name: t('system.registration.save') }));
     expect(await screen.findByText(t('system.registration.saved'))).toBeInTheDocument();
-    expect(putBodies(calls)).toEqual([{ registration_open: false, max_pending_per_user: 7 }]);
+    expect(putBodies(calls)).toEqual([{ registration_open: false, max_pending_per_user: 7, max_versions: null }]);
   });
 
   it('"Đặt về mặc định" writes null for the limit', async () => {
@@ -221,7 +221,7 @@ describe('SystemSettingsPage', () => {
     expect(await screen.findByLabelText(t('system.limit.label'))).toHaveValue(7);
     await user.click(regCard().getByRole('button', { name: t('system.limit.reset') }));
     expect(await screen.findByText(t('system.registration.saved'))).toBeInTheDocument();
-    expect(putBodies(calls)).toEqual([{ max_pending_per_user: null }]);
+    expect(putBodies(calls)).toEqual([{ max_pending_per_user: null, max_versions: null }]);
     expect(screen.getByLabelText(t('system.limit.label'))).toHaveValue(null);
   });
 
@@ -233,9 +233,38 @@ describe('SystemSettingsPage', () => {
     await user.click(await screen.findByRole('checkbox', { name: t('system.registration.open') })); // tắt, CHƯA lưu
     await user.click(regCard().getByRole('button', { name: t('system.limit.reset') }));
     expect(await screen.findByText(t('system.registration.saved'))).toBeInTheDocument();
-    expect(putBodies(calls)).toEqual([{ max_pending_per_user: null }]);
+    expect(putBodies(calls)).toEqual([{ max_pending_per_user: null, max_versions: null }]);
     expect(screen.getByLabelText(t('system.limit.label'))).toHaveValue(null);
     expect(screen.getByRole('checkbox', { name: t('system.registration.open') })).not.toBeChecked();
+  });
+
+  it('saves the number of kept versions and shows the default as a placeholder', async () => {
+    const { calls } = mockApi({ ...AS_ADMIN, 'GET /api/system/settings': { body: SYSTEM },
+      'PUT /api/system/settings': { body: systemWith({ max_versions: 5 }) } });
+    renderSystem();
+    const input = await screen.findByLabelText(t('system.versions.label'));
+    expect(input).toHaveAttribute('placeholder', '3');
+    expect(input).toHaveAttribute('min', '1');
+    expect(input).toHaveAttribute('max', '10');
+    expect(screen.getByText(t('system.versions.hint', { n: 3 }))).toBeInTheDocument();
+    const user = userEvent.setup();
+    await user.type(input, '5');
+    await user.click(regCard().getByRole('button', { name: t('system.registration.save') }));
+    await waitFor(() => expect(putBodies(calls)).toEqual([{ registration_open: true, max_pending_per_user: null, max_versions: 5 }]));
+    expect(await screen.findByText(t('system.registration.saved'))).toBeInTheDocument();
+    expect(input).toHaveValue(5);
+  });
+
+  it('puts invalid_max_versions under the versions field and keeps the rest of the card', async () => {
+    mockApi({ ...AS_ADMIN, 'GET /api/system/settings': { body: SYSTEM },
+      'PUT /api/system/settings': fail(422, { code: 'invalid_max_versions' }) });
+    renderSystem();
+    const input = await screen.findByLabelText(t('system.versions.label'));
+    const user = userEvent.setup();
+    await user.type(input, '11');
+    await user.click(regCard().getByRole('button', { name: t('system.registration.save') }));
+    expect(await within(fieldGroup(input)).findByText(t('error.invalid_max_versions'))).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: t('system.registration.open') })).toBeChecked();
   });
 
   it('shows invalid_limit under the number field', async () => {

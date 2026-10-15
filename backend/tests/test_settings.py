@@ -43,6 +43,8 @@ def test_settings_default_without_keys(client, me):
     ]
     assert body["gemini_models"][0] == {"id": LITE, "label": "Gemini 3.5 Flash-Lite — rẻ, nhanh (khuyến nghị)"}
     assert len(body["gemini_models"]) == 4 and body["credentials"] == []
+    assert (body["advance_mode"], body["default_profile"], body["profile_limit"]) == (False, None, 20)
+    assert [item["kind"] for item in body["profiles"]] == ["preset"] * 5
 
 
 def test_settings_require_login(client):
@@ -447,3 +449,47 @@ def test_get_and_delete_are_never_throttled(client, me, clock):
     assert client.put("/api/settings/preferences", json={"default_engine": "google_free"}).status_code == 200
     assert client.delete("/api/settings/credentials/gemini").status_code == 204
     assert client.delete("/api/settings/credentials/gemini").status_code == 204
+
+
+# ---- Dịch thuần ⇒ tắt Chế độ nâng cao (spec 2026-10-15 §6) ------------------------------------------------------
+
+SLUGS = ["quick", "client", "technical", "beginner", "academic"]
+
+
+def test_a_plain_default_engine_turns_advanced_mode_off_whatever_the_body_says(client, me):
+    body = client.put("/api/settings/preferences", json={"default_engine": "google_free", "advance_mode": True}).json()
+    assert body["advance_mode"] is False and client.get("/api/auth/me").json()["advance_mode"] is False
+    assert all(item["id"].startswith("preset:") for item in body["profiles"])  # không gieo
+    save_key(client, "gemini")  # lần lưu đầu đổi mặc định sang Gemini — KHÔNG tự bật
+    assert client.get("/api/settings").json()["advance_mode"] is False
+    on = client.put("/api/settings/preferences", json={"default_engine": "gemini", "default_model": LITE, "advance_mode": True,
+                                                       "default_profile": "preset:quick"}).json()
+    assert on["advance_mode"] is True and [item["preset_slug"] for item in on["profiles"]] == SLUGS
+    quick = on["profiles"][0]["id"]
+    assert on["default_profile"] == quick
+    off = client.put("/api/settings/preferences", json={"default_engine": "google_free"}).json()  # không nhắc advance_mode
+    assert (off["advance_mode"], off["default_profile"]) == (False, quick)  # tắt công tắc, không xoá gì
+    assert len(off["profiles"]) == 5 and client.get("/api/auth/me").json()["advance_mode"] is False
+
+
+def test_deleting_the_key_behind_the_default_engine_turns_advanced_mode_off_but_another_key_does_not(client, me):
+    save_key(client, "gemini")
+    on = client.put("/api/settings/preferences", json={"default_engine": "gemini", "default_model": LITE, "advance_mode": True}).json()
+    assert on["advance_mode"] is True
+    save_key(client, "google_cloud")
+    assert client.delete("/api/settings/credentials/google_cloud").status_code == 204
+    assert client.get("/api/settings").json()["advance_mode"] is True  # mặc định vẫn là Gemini
+    assert client.delete("/api/settings/credentials/gemini").status_code == 204
+    body = client.get("/api/settings").json()
+    assert (body["default_engine"], body["advance_mode"]) == ("google_free", False)
+    assert [item["preset_slug"] for item in body["profiles"]] == SLUGS  # hồ sơ giữ nguyên
+    assert client.get("/api/auth/me").json()["advance_mode"] is False
+
+
+def test_dropping_the_last_gemini_model_turns_advanced_mode_off(client, me):
+    use_transport(client, (200, {"models": [GEMINI_MODELS_BODY["models"][0]]}))  # key chỉ có Flash-Lite
+    assert put_key(client).status_code == 200
+    assert client.put("/api/settings/preferences", json={"default_engine": "gemini", "default_model": LITE, "advance_mode": True}).json()["advance_mode"] is True
+    assert drop(client, me["id"], LITE) == "Google miễn phí"
+    body = client.get("/api/settings").json()
+    assert (body["default_engine"], body["advance_mode"]) == ("google_free", False)

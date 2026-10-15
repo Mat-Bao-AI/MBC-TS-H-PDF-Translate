@@ -8,9 +8,10 @@ import { PageContainer } from '../../components/PageContainer';
 import { useLinkClick } from '../../components/RouterAnchor';
 import { t, type MessageKey } from '../../i18n/t';
 
-const TABS: { to: string; label: MessageKey; admin?: boolean }[] = [
+const TABS: { to: string; label: MessageKey; admin?: boolean; advance?: boolean }[] = [
   { to: '/settings/account', label: 'settings.tab.account' },
   { to: '/settings/translation', label: 'settings.tab.translation' },
+  { to: '/settings/profiles', label: 'settings.tab.profiles', advance: true },
   { to: '/settings/system', label: 'settings.tab.system', admin: true },
 ];
 
@@ -52,7 +53,7 @@ export function SettingsLayout() {
       <FlexBox flexDirection={{ _: 'column', sm: 'row' }} gap={24} mt={24}>
         <Box as="nav" aria-label={t('settings.tabs')} width={{ _: '100%', sm: '220px' }} flexShrink={0}>
           <FlexBox flexDirection={{ _: 'row', sm: 'column' }}>
-            {TABS.filter((tab) => !tab.admin || user?.is_admin).map((tab) => (
+            {TABS.filter((tab) => (!tab.admin || user?.is_admin) && (!tab.advance || user?.advance_mode)).map((tab) => (
               <Tab key={tab.to} to={tab.to} label={t(tab.label)} current={pathname === tab.to} />
             ))}
           </FlexBox>

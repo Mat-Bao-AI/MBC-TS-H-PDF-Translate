@@ -33,6 +33,7 @@ class SettingsBody(BaseModel):
     smtp: SmtpBody | None = None
     registration_open: bool | None = None
     max_pending_per_user: Any = None  # phân biệt "bỏ qua" và null qua model_fields_set; kiểu lỏng → service trả invalid_limit
+    max_versions: Any = None  # như max_pending_per_user: phân biệt bỏ qua / null qua model_fields_set
 
 
 class TestMailBody(BaseModel):
@@ -57,7 +58,8 @@ def get_settings(request: Request, db: Session = Depends(get_db)) -> dict:
 def put_settings(body: SettingsBody, request: Request, db: Session = Depends(get_db)) -> dict:
     return service.update_settings(db, *_ctx(request), smtp=_smtp(body.smtp), registration_open=body.registration_open,
                                    max_pending=body.max_pending_per_user,
-                                   max_pending_set="max_pending_per_user" in body.model_fields_set)
+                                   max_pending_set="max_pending_per_user" in body.model_fields_set,
+                                   max_versions=body.max_versions, max_versions_set="max_versions" in body.model_fields_set)
 
 
 @router.delete("/settings/smtp", status_code=204)

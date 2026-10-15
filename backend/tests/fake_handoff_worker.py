@@ -5,12 +5,15 @@ Ghi env nhận được vào <thư mục job>/env-seen.json (thư mục chứa t
 rebuild/) để test kiểm — KHÔNG in key ra stdout/stderr, trừ tên tệp "leaky" (cố tình, để kiểm runner có che key
 trong message lưu DB hay không). `table_seen` = thư mục ra có sẵn segments.jsonl (runner chép bảng vào rebuild/);
 `out_dir_listing` = tên các mục trong thư mục ra lúc worker bắt đầu (runner đã dọn rebuild/ thế nào).
+`meta_matches` = segments.meta.json có sẵn trong thư mục ra trùng lựa chọn của lượt này (provider/model/ngôn ngữ/sha256 chỉ dẫn) —
+đúng phép so của handoff_worker._resume, tức worker thật sẽ dùng lại bảng thay vì gọi nhà cung cấp.
 Hành vi theo tên tệp: fail (key bị từ chối) / slow (ngủ 3 s ở bước dịch) / hang (đứng ở bước dịch, đoạn 3/10, tới
 khi bị giết) / weirdstage (phát một stage lạ mà worker thật không bao giờ gửi, runner phải lọc bỏ) / leaky (làm lộ
 key ra stderr + "error" — runner phải che trước khi lưu) / fontline (phát {"font"}) / rebuildfail (chỉ lỗi khi
 đang dựng lại) / gone (Google đã gỡ model: lỗi code=model_unavailable) / newtable (chỉ khi dựng lại/dịch lại: ghi bảng
 đoạn MỚI + meta của lựa chọn hiện tại vào thư mục ra, trước mọi marker khác).
 """
+import hashlib
 import json
 import os
 import shutil
@@ -28,13 +31,31 @@ source, out_dir, language = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 api_key = os.environ.get("TRANSLATE_API_KEY") or ""
 rebuilding = out_dir.name == "rebuild"
 font = os.environ.get("TRANSLATE_FONT")
+
+
+def recorded_meta_matches() -> bool:
+    """Như handoff_worker._resume: meta lượt này dựng từ env + ngôn ngữ trong argv; meta cũ thiếu khoá "instructions" = ""."""
+    instructions = os.environ.get("TRANSLATE_INSTRUCTIONS", "")
+    meta = {"provider": os.environ.get("TRANSLATE_PROVIDER", ""), "model": os.environ.get("TRANSLATE_MODEL", ""), "target_language": language,
+            "instructions": hashlib.sha256(instructions.encode("utf-8")).hexdigest() if instructions else ""}
+    try:
+        recorded = json.loads((out_dir / "segments.meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if isinstance(recorded, dict):
+        recorded.setdefault("instructions", "")
+    return recorded == meta
+
+
 (source.parent / "env-seen.json").write_text(json.dumps({
     "provider": os.environ.get("TRANSLATE_PROVIDER"),
     "model": os.environ.get("TRANSLATE_MODEL"),
     "font": font,
+    "instructions": os.environ.get("TRANSLATE_INSTRUCTIONS"),
     "api_key": api_key,
     "argv": sys.argv[1:],
     "table_seen": (out_dir / "segments.jsonl").is_file(),
+    "meta_matches": recorded_meta_matches(),
     "out_dir_listing": sorted(child.name for child in out_dir.iterdir()),
     "has_secret_key": "SECRET_KEY" in os.environ,
     "has_smtp_password": "SMTP_PASSWORD" in os.environ,
@@ -46,6 +67,8 @@ if rebuilding and "newtable" in name:  # dịch lại từ đầu: worker ghi b�
     (out_dir / "segments.jsonl").write_text('{"src": "x", "dst": "y"}\n', encoding="utf-8")
     (out_dir / "segments.meta.json").write_text(json.dumps({
         "provider": os.environ.get("TRANSLATE_PROVIDER"), "model": os.environ.get("TRANSLATE_MODEL"), "target_language": language,
+        "instructions": hashlib.sha256(os.environ.get("TRANSLATE_INSTRUCTIONS", "").encode("utf-8")).hexdigest()
+        if os.environ.get("TRANSLATE_INSTRUCTIONS") else "",
     }), encoding="utf-8")
 if "fontline" in name:
     emit({"font": font if font in ("sans", "serif") else "sans"})

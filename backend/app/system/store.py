@@ -28,6 +28,15 @@ def effective_pending_limit(db: Session, settings: Settings) -> int:
     return settings.max_pending_per_user if value is None else value
 
 
+DEFAULT_MAX_VERSIONS = 3  # spec 2026-10-14 §5: hằng trong code (không env); tính cả bản hiện tại (3 = hiện tại + 2 bản cũ)
+
+
+def effective_max_versions(db: Session) -> int:
+    """instance_settings.max_versions khác NULL thì dùng, không thì DEFAULT_MAX_VERSIONS. Runner đọc MỖI lần thay bản."""
+    value = instance_row(db).max_versions
+    return DEFAULT_MAX_VERSIONS if value is None else value
+
+
 def site_url(db: Session, settings: Settings) -> tuple[str | None, str | None]:
     """Địa chỉ trang cho MỌI link trong thư → (địa chỉ, nguồn): env APP_BASE_URL ("env") > ghi lúc /setup ("setup") >
     (None, None) = chưa biết → thư coi như tắt (system.mail). Không bao giờ suy từ Host của request thường."""

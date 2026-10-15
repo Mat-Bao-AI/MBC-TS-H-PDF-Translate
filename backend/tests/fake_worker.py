@@ -28,6 +28,7 @@ rebuilding = out_dir.name == "rebuild"
 font = os.environ.get("TRANSLATE_FONT")
 (source.parent / "env-seen.json").write_text(json.dumps({
     "font": font,
+    "instructions": os.environ.get("TRANSLATE_INSTRUCTIONS"),  # luôn None: chỉ worker handoff nhận biến này
     "argv": sys.argv[1:],
     "has_secret_key": "SECRET_KEY" in os.environ,
     "has_smtp_password": "SMTP_PASSWORD" in os.environ,

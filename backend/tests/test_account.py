@@ -78,7 +78,7 @@ def test_profile_trims_and_saves_the_display_name(client, me):
     response = client.put("/api/account/profile", json={"display_name": "  Nguyễn Văn Cường  "})
     assert response.status_code == 200
     assert response.json() == {"id": me["id"], "email": "an@example.com", "display_name": "Nguyễn Văn Cường", "is_admin": False,
-                                "smtp_notice_dismissed": False}
+                                "smtp_notice_dismissed": False, "advance_mode": False}
     assert client.get("/api/auth/me").json()["display_name"] == "Nguyễn Văn Cường"
     fifty = "x" * 50
     assert client.put("/api/account/profile", json={"display_name": fifty}).json()["display_name"] == fifty
@@ -444,7 +444,7 @@ def test_confirm_changes_the_email_and_warns_the_old_address(client, me, mailer)
     response = confirm(client, token)
     assert response.status_code == 200
     assert response.json() == {"id": me["id"], "email": "moi@example.com", "display_name": None, "is_admin": False,
-                                "smtp_notice_dismissed": False}
+                                "smtp_notice_dismissed": False, "advance_mode": False}
     assert "set-cookie" not in response.headers
     assert client.get("/api/auth/me").json()["email"] == "moi@example.com"  # phiên đang có vẫn dùng được
     warning = mailer.last_to("an@example.com")

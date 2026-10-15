@@ -87,7 +87,7 @@ def send_later(request: Request, background: BackgroundTasks, mail: Mail | None)
 
 def me_body(user: User) -> dict:
     return {"id": user.id, "email": user.email, "display_name": user.display_name, "is_admin": user.is_admin,
-            "smtp_notice_dismissed": user.smtp_notice_dismissed}
+            "smtp_notice_dismissed": user.smtp_notice_dismissed, "advance_mode": user.advance_mode}
 
 
 def signed_in(db: Session, auth: AuthService, user: User) -> JSONResponse:

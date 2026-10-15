@@ -1,12 +1,13 @@
 import { useEffect, useState, type ComponentProps } from 'react';
 import styled from '@emotion/styled';
-import { Alert, Dialog, FlexBox, FormGroup, Radio, RadioGroup, Select, Spinner } from '@codecademy/gamut';
-import type { FileItem, RetranslateChoice } from '../api/files';
+import { Alert, Dialog, FlexBox, FormGroup, Radio, RadioGroup, Select, Spinner, Text } from '@codecademy/gamut';
+import type { FileItem, RetranslateRequest } from '../api/files';
 import { settingsApi, type SettingsInfo } from '../api/settings';
 import { choiceFor, chosenEngine, initialChoice, type EngineChoice } from '../files/engines';
 import { fontOptions } from '../files/fonts';
 import { useMeta } from '../files/useMeta';
 import { t } from '../i18n/t';
+import { AdvancedFields, initialAdvanced, toAdvancedChoice, type AdvancedState } from './AdvancedFields';
 import { EngineChoiceFields } from './EngineChoiceFields';
 
 /** Một tệp (chọn sẵn theo chính tệp đó) hoặc nhiều tệp đã chọn (`count`, kể cả "Chọn tất cả N tệp"). */
@@ -20,9 +21,10 @@ type Props = {
   onClose: () => void;
   /**
    * Gamut gọi onRequestClose (→ onClose) TRƯỚC hàm này: hộp đã đóng, trang cha gửi request và báo kết quả trên trang
-   * (như "Dựng lại"). null = hàng loạt, "Giữ cài đặt riêng của từng tệp".
+   * (như "Dựng lại"). null = hàng loạt, "Giữ cài đặt riêng của từng tệp". Đơn: kèm `profile/style/context` khi động cơ là AI
+   * và Chế độ nâng cao bật (khoá không có nội dung thì bỏ hẳn, không gửi null).
    */
-  onConfirm: (settings: RetranslateChoice | null) => void;
+  onConfirm: (settings: RetranslateRequest | null) => void;
 };
 
 // Dialog của Gamut cao tối đa (khung nhìn − 4rem) nhưng không tự cuộn: dải cảnh báo + bốn trường thì nút "Dịch lại" rơi
@@ -41,6 +43,7 @@ export function RetranslateDialog({ target, onClose, onConfirm }: Props) {
   const [language, setLanguage] = useState<string | null>(null);
   const [choice, setChoice] = useState<EngineChoice | null>(null);
   const [font, setFont] = useState<string | null>(null);
+  const [advanced, setAdvanced] = useState<AdvancedState | null>(null);
 
   useEffect(() => {
     if (!open) {
@@ -50,6 +53,7 @@ export function RetranslateDialog({ target, onClose, onConfirm }: Props) {
       setLanguage(null);
       setChoice(null);
       setFont(null);
+      setAdvanced(null);
       return;
     }
     // Không cache (như hộp tải lên): người dùng có thể vừa thêm/xoá key ở Cài đặt.
@@ -59,11 +63,13 @@ export function RetranslateDialog({ target, onClose, onConfirm }: Props) {
       .then((loaded) => {
         if (!alive) return;
         setSettings(loaded);
+        // null (tệp cơ bản) ≠ bỏ trống (tải lên): dịch lại đơn không bao giờ chọn sẵn hồ sơ mặc định (spec §8).
+        setAdvanced(loaded.advance_mode && item ? initialAdvanced(loaded, item.config ?? null) : null);
         setSettingsState('ready');
       })
       .catch(() => { if (alive) setSettingsState('failed'); });
     return () => { alive = false; };
-  }, [open]);
+  }, [open, item?.id]);
 
   const prefix = item ? 'retranslate' : 'bulk-retranslate';
   const withFields = item !== null || scope === 'apply';
@@ -76,8 +82,20 @@ export function RetranslateDialog({ target, onClose, onConfirm }: Props) {
   const ready = !withFields || chosenChoice !== null;
 
   function confirm() {
-    if (!withFields) onConfirm(null);
-    else if (chosenChoice) onConfirm({ language: chosenLanguage, ...chosenEngine(chosenChoice), font: chosenFont });
+    if (!withFields) {
+      onConfirm(null);
+      return;
+    }
+    if (!chosenChoice) return;
+    const four = { language: chosenLanguage, ...chosenEngine(chosenChoice), font: chosenFont };
+    const extra = item && settings && advanced && four.engine === 'gemini' ? toAdvancedChoice(advanced, settings) : null;
+    // Server coi mọi khoá nâng cao có mặt là "đã yêu cầu": chỉ thêm khoá có nội dung thật.
+    onConfirm({
+      ...four,
+      ...(extra?.profile ? { profile: extra.profile } : {}),
+      ...(extra?.style ? { style: extra.style } : {}),
+      ...(extra?.context ? { context: extra.context } : {}),
+    });
   }
 
   let title = '';
@@ -96,6 +114,7 @@ export function RetranslateDialog({ target, onClose, onConfirm }: Props) {
       <FieldsScroll data-testid="retranslate-fields">
         <FlexBox flexDirection="column" gap={16}>
           <Alert type="notice" placement="inline">{warning}</Alert>
+          {!item && settings?.advance_mode && <Text fontSize={14} color="text-secondary">{t('retranslate.bulkKeepsConfig')}</Text>}
           {!item && (
             // Như hộp tải lên: `checked` trên từng Radio, htmlForPrefix cho id, không truyền `id` cho Radio.
             <RadioGroup name="bulk-retranslate-scope" htmlForPrefix="bulk-retranslate-scope" aria-label={t('retranslate.scope')}
@@ -121,6 +140,10 @@ export function RetranslateDialog({ target, onClose, onConfirm }: Props) {
                   <Select key={`${prefix}-font-${defaultFont}`} id={`${prefix}-font`} defaultValue={chosenFont}
                     options={fontOptions()} onChange={(event) => setFont(event.target.value)} />
                 </FormGroup>
+              )}
+              {item && settings && advanced && chosenChoice && chosenChoice.mode === 'ai' && (
+                <AdvancedFields idPrefix="retranslate" settings={settings} value={advanced} onChange={setAdvanced}
+                  onProfilesChange={(profiles) => setSettings((current) => (current ? { ...current, profiles } : current))} />
               )}
             </>
           )}

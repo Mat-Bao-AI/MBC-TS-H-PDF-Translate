@@ -40,6 +40,7 @@ function useCardState() {
       const apiError = toApiError(caught);
       if (apiError.code === 'invalid_smtp' && typeof apiError.params.field === 'string') setErrorField(apiError.params.field);
       else if (apiError.code === 'invalid_limit') setErrorField('limit');
+      else if (apiError.code === 'invalid_max_versions') setErrorField('versions');
       else setError(apiError);
     } finally {
       inFlight.current = false;
@@ -155,31 +156,38 @@ function SmtpCard({ info, siteUrl, siteUrlSource, onChanged, onReload }: SmtpCar
   );
 }
 
+const numberField = (value: number | null) => (value === null ? '' : String(value));
+
 function RegistrationCard({ settings, onChanged }: { settings: SystemSettings; onChanged: (next: SystemSettings) => void }) {
   const { refreshInstance } = useAuth();
   const [open, setOpen] = useState(settings.registration_open);
-  const [limit, setLimit] = useState(settings.max_pending_per_user === null ? '' : String(settings.max_pending_per_user));
+  const [limit, setLimit] = useState(numberField(settings.max_pending_per_user));
+  const [versions, setVersions] = useState(numberField(settings.max_versions));
   const state = useCardState();
 
-  const { registration_open, max_pending_per_user } = settings;
+  const { registration_open, max_pending_per_user, max_versions } = settings;
   // Mỗi ô chỉ theo giá trị của chính nó: lưu thẻ SMTP / "Đặt về mặc định" không được làm mất thay đổi chưa lưu của ô kia.
   useEffect(() => { setOpen(registration_open); }, [registration_open]);
-  useEffect(() => { setLimit(max_pending_per_user === null ? '' : String(max_pending_per_user)); }, [max_pending_per_user]);
+  useEffect(() => { setLimit(numberField(max_pending_per_user)); }, [max_pending_per_user]);
+  useEffect(() => { setVersions(numberField(max_versions)); }, [max_versions]);
 
   const save = () => state.run(async () => {
-    const next = await systemApi.save({ registration_open: open, max_pending_per_user: limit === '' ? null : Number(limit) });
+    const next = await systemApi.save({ registration_open: open, max_pending_per_user: limit === '' ? null : Number(limit),
+      max_versions: versions === '' ? null : Number(versions) });
     onChanged(next);
     setOpen(next.registration_open);
-    setLimit(next.max_pending_per_user === null ? '' : String(next.max_pending_per_user));
+    setLimit(numberField(next.max_pending_per_user));
+    setVersions(numberField(next.max_versions));
     await refreshInstance(); // registration_open → trang đăng ký / link "Tạo tài khoản"
     return t('system.registration.saved');
   });
 
-  // CHỈ hạn chờ: công tắc đăng ký đang sửa dở không được lưu theo (và vẫn hiện như đang sửa).
+  // CHỈ hạn chờ và số bản giữ lại: công tắc đăng ký đang sửa dở không được lưu theo (và vẫn hiện như đang sửa).
   const resetLimit = () => state.run(async () => {
-    const next = await systemApi.save({ max_pending_per_user: null });
+    const next = await systemApi.save({ max_pending_per_user: null, max_versions: null });
     onChanged(next);
     setLimit('');
+    setVersions('');
     return t('system.registration.saved');
   });
 
@@ -191,6 +199,11 @@ function RegistrationCard({ settings, onChanged }: { settings: SystemSettings; o
           error={state.errorField === 'limit' ? errorText('invalid_limit') : undefined} isSoloField>
           <Input id="system-limit" type="number" min={1} max={100} value={limit} placeholder={String(settings.max_pending_default)}
             error={state.errorField === 'limit'} onChange={(event) => setLimit(event.target.value)} />
+        </FormGroup>
+        <FormGroup label={t('system.versions.label')} htmlFor="system-versions" description={t('system.versions.hint', { n: settings.max_versions_default })}
+          error={state.errorField === 'versions' ? errorText('invalid_max_versions') : undefined} isSoloField>
+          <Input id="system-versions" type="number" min={1} max={10} value={versions} placeholder={String(settings.max_versions_default)}
+            error={state.errorField === 'versions'} onChange={(event) => setVersions(event.target.value)} />
         </FormGroup>
         <CardAlerts error={state.error} notice={state.notice} />
         <FlexBox gap={8} flexWrap="wrap">

@@ -71,11 +71,19 @@ def allowed_models(credential: ApiCredential | None) -> list[dict]:
 
 
 def settings_payload(db: Session, secret_key: str, user: User) -> dict:
+    from ..profiles.presets import PROFILE_LIMIT  # import muộn: profiles.service → auth.account; tránh vòng providers ↔ profiles
+    from ..profiles.service import effective_default_profile, ensure_seeded, list_profiles
+
+    ensure_seeded(db, user)  # spec 2026-10-15 §5: GET /api/settings và phản hồi PUT preferences/credentials gieo một lần cho người đang bật chế độ
     creds = usable_credentials(db, secret_key, user.id)
     return {
         "default_engine": user.default_engine,
         "default_model": user.default_model,
         "default_font": user.default_font,
+        "advance_mode": user.advance_mode,
+        "default_profile": effective_default_profile(db, user),
+        "profiles": list_profiles(db, user),
+        "profile_limit": PROFILE_LIMIT,
         "engines": engine_items({provider: provider in creds for provider in PROVIDERS}),
         "gemini_models": allowed_models(creds.get("gemini")),
         "credentials": [
@@ -120,15 +128,33 @@ def _choose(db: Session, secret_key: str, user: User, engine_id: str, model: str
     return engine.id, _pick_model(credential, model, fallback)
 
 
+def _sync_advance_mode(user: User) -> None:
+    """Bất biến (spec 2026-10-15 §6): Chế độ nâng cao chỉ có nghĩa với động cơ AI — động cơ mặc định là thuần thì công tắc tắt (hồ sơ,
+    default_profile, snapshot giữ nguyên; bật lại là việc của người dùng). Gọi ở MỌI chỗ đổi default_engine về thuần."""
+    engine = ENGINE_BY_ID.get(user.default_engine)
+    if engine is None or engine.mode != "ai":
+        user.advance_mode = False
+
+
 def set_preferences(db: Session, secret_key: str, user: User, default_engine: str, default_model: str | None,
-                    default_font: str | None = None) -> dict:
-    """`default_font` None = giữ nguyên font đã lưu (body cũ không có khoá này)."""
+                    default_font: str | None = None, *, advance_mode: bool | None = None, default_profile: object = None,
+                    default_profile_set: bool = False) -> dict:
+    """`default_font`/`advance_mode` None = giữ nguyên; `default_profile` chỉ đổi khi `default_profile_set` (null = bỏ hồ sơ mặc định).
+    Kiểm HẾT (font, hồ sơ, engine/model) rồi mới ghi: một ô sai thì không đổi gì."""
+    from ..profiles.service import check_default_profile  # import muộn: tránh vòng providers ↔ profiles
+
     if default_font is not None and default_font not in PROFILE_IDS:
         raise ApiError(400, "unsupported_font")
+    chosen_profile = check_default_profile(db, user, default_profile) if default_profile_set else None
     engine_id, model = _choose(db, secret_key, user, default_engine, default_model, None)
     user.default_engine, user.default_model = engine_id, model
     if default_font is not None:
         user.default_font = default_font
+    if advance_mode is not None:
+        user.advance_mode = advance_mode
+    _sync_advance_mode(user)  # thân gửi advance_mode=true với động cơ thuần vẫn ra false
+    if default_profile_set:
+        user.default_profile = chosen_profile
     db.commit()
     return settings_payload(db, secret_key, user)
 
@@ -212,6 +238,7 @@ def drop_gemini_model(db: Session, user_id: str, model: str) -> str | None:
         if not choices:
             user.default_engine, user.default_model = "google_free", None
             label = ENGINE_BY_ID["google_free"].label
+            _sync_advance_mode(user)
         else:
             ids = [choice["id"] for choice in choices]
             user.default_model = DEFAULT_GEMINI_MODEL if DEFAULT_GEMINI_MODEL in ids else ids[0]
@@ -226,4 +253,5 @@ def delete_credential(db: Session, user: User, provider: str) -> None:
     default = ENGINE_BY_ID.get(user.default_engine)
     if default is not None and default.provider == provider:
         user.default_engine, user.default_model = "google_free", None
+        _sync_advance_mode(user)
     db.commit()

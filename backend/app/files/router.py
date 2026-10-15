@@ -12,6 +12,7 @@ from ..config import Settings
 from ..deps import current_user, get_db
 from ..engine.jobs import JobRunner
 from ..models import User
+from ..profiles import snapshot as snapshots
 from ..providers.catalog import engine_items, model_choices
 from . import service
 from .languages import LANGUAGES
@@ -23,14 +24,22 @@ class RebuildBody(BaseModel):
     font: str
 
 
-class RetranslateBody(BaseModel):
-    """Đủ bốn lựa chọn (spec 2026-10-05 §8); `model` null với engine không cần model."""
+class BasicChoice(BaseModel):
+    """Đủ bốn lựa chọn (spec 2026-10-05 §8); `model` null với engine không cần model. Dùng cho `settings` của hàng loạt."""
 
     model_config = ConfigDict(extra="forbid")
     language: str
     engine: str
     model: str | None = None
     font: str
+
+
+class RetranslateBody(BasicChoice):
+    """Dịch lại đơn: thêm trường nâng cao (spec 2026-10-14 §7) — kiểm trong profiles.snapshot."""
+
+    profile: str | None = None
+    style: dict | None = None
+    context: str | None = None
 
 
 class BulkSelection(BaseModel):
@@ -57,7 +66,7 @@ class BulkDeleteBody(BulkSelection):
 
 
 class BulkRetranslateBody(BulkSelection):
-    settings: RetranslateBody | None = None  # null = giữ cài đặt riêng của từng tệp
+    settings: BasicChoice | None = None  # null = giữ cài đặt riêng của từng tệp; không nhận trường nâng cao (spec 2026-10-14 §7)
 
 
 def _runner(request: Request) -> JobRunner:
@@ -108,11 +117,15 @@ def upload_file(
     engine: str | None = Form(None),
     model: str | None = Form(None),
     font: str | None = Form(None),
+    profile: str | None = Form(None),
+    style: str | None = Form(None),
+    context: str | None = Form(None),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
     row = service.create_file(db, _runner(request), _settings(request), user, file.filename or "", language, file.file,
-                              engine=engine or None, model=model or None, font=font or None)
+                              engine=engine or None, model=model or None, font=font or None,
+                              profile=profile or None, style=snapshots.parse_style_form(style), context=context or None)
     return service.to_item(row, None)
 
 
@@ -132,7 +145,19 @@ def bulk_retranslate_files(body: BulkRetranslateBody, request: Request, user: Us
 @router.get("/files/{file_id}")
 def get_file(file_id: str, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     row = service.get_owned(db, user.id, file_id)
-    return service.to_item(row, _runner(request).progress(row.id))
+    return service.to_detail(db, _settings(request), row, _runner(request).progress(row.id))
+
+
+def _pdf_response(path, name: str, inline: bool) -> FileResponse:
+    response = FileResponse(path, media_type="application/pdf", filename=name,
+                            content_disposition_type="inline" if inline else "attachment")
+    # Trình duyệt không được tự đoán content-type khi hiển thị inline trong <iframe>.
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # "Dựng lại" thay bản dịch tại chỗ (cùng URL): không cho trình duyệt giữ bản cũ trong cache. FileResponse không
+    # trả 304 nên "no-cache" (hỏi lại theo ETag) cũng tải lại cả tệp — "no-store" bằng chi phí, lại không ghi tài
+    # liệu riêng của người dùng xuống cache đĩa.
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @router.get("/files/{file_id}/download")
@@ -146,17 +171,16 @@ def download_file(
 ) -> FileResponse:
     row = service.get_owned(db, user.id, file_id)
     path, name = service.download_target(_settings(request), row, kind)
-    response = FileResponse(
-        path, media_type="application/pdf", filename=name,
-        content_disposition_type="inline" if inline else "attachment",
-    )
-    # Trình duyệt không được tự đoán content-type khi hiển thị inline trong <iframe>.
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    # "Dựng lại" thay bản dịch tại chỗ (cùng URL): không cho trình duyệt giữ bản cũ trong cache. FileResponse không
-    # trả 304 nên "no-cache" (hỏi lại theo ETag) cũng tải lại cả tệp — "no-store" bằng chi phí, lại không ghi tài
-    # liệu riêng của người dùng xuống cache đĩa.
-    response.headers["Cache-Control"] = "no-store"
-    return response
+    return _pdf_response(path, name, inline)
+
+
+@router.get("/files/{file_id}/versions/{version_id}/download")
+def download_version(file_id: str, version_id: str, request: Request, inline: bool = False, user: User = Depends(current_user),
+                     db: Session = Depends(get_db)) -> FileResponse:
+    row = service.get_owned(db, user.id, file_id)  # 404 not_found trước (tệp của người khác không lộ gì)
+    version = service.get_version(db, row, version_id)
+    path, name = service.version_target(_settings(request), row, version)
+    return _pdf_response(path, name, inline)
 
 
 @router.post("/files/{file_id}/rebuild", status_code=202)
@@ -166,12 +190,21 @@ def rebuild_file(file_id: str, body: RebuildBody, request: Request, user: User =
     return service.to_item(service.rebuild_file(db, _runner(request), _settings(request), row, body.font), None)
 
 
+@router.post("/files/{file_id}/versions/{version_id}/restore", status_code=202)
+def restore_version(file_id: str, version_id: str, request: Request, user: User = Depends(current_user),
+                    db: Session = Depends(get_db)) -> dict:
+    row = service.get_owned(db, user.id, file_id)  # 404 not_found trước (tệp của người khác không lộ gì)
+    version = service.get_version(db, row, version_id)
+    return service.to_item(service.restore_version(db, _runner(request), _settings(request), row, version), None)
+
+
 @router.post("/files/{file_id}/retranslate", status_code=202)
 def retranslate_file(file_id: str, body: RetranslateBody, request: Request, user: User = Depends(current_user),
                      db: Session = Depends(get_db)) -> dict:
     row = service.get_owned(db, user.id, file_id)
     queued = service.retranslate_file(db, _runner(request), _settings(request), user, row, language=body.language,
-                                      engine=body.engine, model=body.model, font=body.font)
+                                      engine=body.engine, model=body.model, font=body.font,
+                                      profile=body.profile, style=body.style, context=body.context)
     return service.to_item(queued, None)
 
 

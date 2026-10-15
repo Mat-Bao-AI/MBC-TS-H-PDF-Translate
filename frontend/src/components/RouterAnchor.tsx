@@ -4,16 +4,17 @@ import { useNavigate } from 'react-router-dom';
 
 type Props = { to: string; children: ReactNode; variant?: 'inline' | 'standard' | 'interface' };
 
+/** Click thường → chặn mặc định và điều hướng client-side; Ctrl/⌘/Shift/Alt/chuột giữa → để trình duyệt lo. */
+export function followLink(event: MouseEvent, navigate: (to: string) => void, to: string) {
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  navigate(to);
+}
+
 /** Điều hướng client-side cho một phần tử có href thật: click thường → navigate, Ctrl/⌘/chuột giữa → để trình duyệt lo. */
 export function useLinkClick(to: string) {
   const navigate = useNavigate();
-  return (event: MouseEvent) => {
-    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
-      return;
-    }
-    event.preventDefault();
-    navigate(to);
-  };
+  return (event: MouseEvent) => followLink(event, navigate, to);
 }
 
 /** Anchor của Gamut không nhận `as={Link}` (lỗi kiểu) — nên tự điều hướng, vẫn giữ href thật cho Ctrl+click. */

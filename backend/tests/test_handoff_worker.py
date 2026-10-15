@@ -1,4 +1,7 @@
+import hashlib
 import json
+import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,8 +47,9 @@ def fake_core(calls: list, *, untranslated: int = 2, fail_pass: int | None = Non
 
 
 def fake_provider(seen: list, table: dict | None = None, error: str | None = None):
-    def translate(provider, api_key, model, language, segments, on_progress, on_batch=None):
-        seen.append({"provider": provider, "api_key": api_key, "model": model, "language": language, "segments": list(segments)})
+    def translate(provider, api_key, model, language, segments, on_progress, on_batch=None, instructions=""):
+        seen.append({"provider": provider, "api_key": api_key, "model": model, "language": language, "segments": list(segments),
+                     "instructions": instructions})
         if error:
             raise ProviderError(error)
         on_progress(0, len(segments))
@@ -76,7 +80,7 @@ def test_two_passes_translate_and_count_untranslated(job):
     assert calls[1]["table"] == [{"src": "Xin chào <b0></b0>", "dst": "Hello <b0></b0>"}]
     [call] = seen
     assert call == {"provider": "gemini", "api_key": "AIza-x", "model": "gemini-3.5-flash-lite", "language": "vi",
-                    "segments": ["Xin chào <b0></b0>", "Tạm biệt"]}
+                    "segments": ["Xin chào <b0></b0>", "Tạm biệt"], "instructions": ""}
     stages = [(line["stage"], line["p"], line["t"]) for line in emitted if "stage" in line]
     # Dòng (stage, 0, 0) đầu mỗi bước là của worker (runner đổi thông điệp ngay); các dòng sau theo callback.
     assert stages == [("split", 0, 0), ("split", 1, 2), ("split", 2, 2),
@@ -124,7 +128,7 @@ def test_a_real_google_error_becomes_one_sanitised_stderr_line_and_a_coded_failu
     key = "AIza-real-looking-key-0042"
     transport = FakeTransport(GOOGLE_ERRORS["gemini_service_disabled"])
 
-    def translate(provider, api_key, model, language, segments, on_progress, on_batch=None):
+    def translate(provider, api_key, model, language, segments, on_progress, on_batch=None, instructions=""):
         return translate_segments(provider, api_key, model, language, segments, transport=transport,
                                   on_progress=on_progress, sleep=lambda seconds: None)
 
@@ -138,15 +142,17 @@ def test_a_real_google_error_becomes_one_sanitised_stderr_line_and_a_coded_failu
 
 
 LONG = ["a" * 5000, "b" * 5000, "c" * 5000]  # 3 lô (5000 + 5000 > BATCH_CHARS)
-META = {"provider": "gemini", "model": "gemini-3.5-flash-lite", "target_language": "vi"}
+META_LEGACY = {"provider": "gemini", "model": "gemini-3.5-flash-lite", "target_language": "vi"}  # meta trước 2026-10-14
+META = {**META_LEGACY, "instructions": ""}
 
 
 def real_translate(transport):
     """translate_segments thật trên FakeTransport — không mạng, không ngủ."""
 
-    def translate(provider, api_key, model, language, segments, on_progress, on_batch=None):
+    def translate(provider, api_key, model, language, segments, on_progress, on_batch=None, instructions=""):
         return translate_segments(provider, api_key, model, language, segments, transport=transport,
-                                  on_progress=on_progress, on_batch=on_batch, sleep=lambda seconds: None)
+                                  on_progress=on_progress, on_batch=on_batch, sleep=lambda seconds: None,
+                                  instructions=instructions)
 
     return translate
 
@@ -156,10 +162,10 @@ def fail_on_c(method, url, headers, payload):
     return GOOGLE_ERRORS["gemini_per_day"] if text.startswith("c") else (200, gemini_reply(["VI " + text]))
 
 
-def run_long(out, source, transport, *, model="gemini-3.5-flash-lite", calls=None, emitted=None):
+def run_long(out, source, transport, *, model="gemini-3.5-flash-lite", calls=None, emitted=None, instructions=""):
     return run(source, out, "vi", provider="gemini", api_key="AIza-x", model=model,
                translate_pdf=fake_core(calls if calls is not None else [], texts=LONG), translate=real_translate(transport),
-               emit=(emitted if emitted is not None else []).append, diagnose=lambda line: None)
+               emit=(emitted if emitted is not None else []).append, diagnose=lambda line: None, instructions=instructions)
 
 
 def table_on_disk(out) -> dict:
@@ -307,3 +313,84 @@ def test_font_error_codes_have_their_own_messages():
     for code in ("font_profile_unsupported", "font_files_missing"):
         assert ERROR_MESSAGES[code] == fonts.ERROR_MESSAGES[code]
     assert ERROR_MESSAGES["font_files_missing"] == "Máy chủ thiếu tệp font của bản dịch. Báo quản trị viên."
+
+
+def test_instructions_reach_the_provider_and_are_fingerprinted_in_the_meta(job):
+    source, out = job
+    seen, emitted = [], []
+    text = "Style requirements…\n- Tone: warm."
+    assert run(source, out, "vi", provider="gemini", api_key="AIza-x", model="gemini-3.5-flash-lite", translate_pdf=fake_core([]),
+               translate=fake_provider(seen), emit=emitted.append, instructions=text) == 0
+    assert seen[0]["instructions"] == text
+    meta = json.loads((out / "segments.meta.json").read_text(encoding="utf-8"))
+    assert meta == {**META_LEGACY, "instructions": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+    assert "Style requirements" not in json.dumps(emitted)  # chỉ dẫn không lọt ra stdout
+
+
+def test_changed_instructions_do_not_resume_the_previous_table(job, monkeypatch):
+    monkeypatch.setattr("app.providers.client.PARALLEL", 1)
+    source, out = job
+    assert run_long(out, source, FakeTransport(handler=fail_on_c), instructions="- Tone: warm.") == 1
+    assert len(table_on_disk(out)) == 2  # 2 lô đã trả tiền
+    second = FakeTransport(handler=gemini_echo())
+    assert run_long(out, source, second, instructions="- Tone: formal.") == 0
+    assert len(second.calls) == 3  # bảng của chỉ dẫn khác không được dùng lại
+    third = FakeTransport(handler=gemini_echo())
+    assert run_long(out, source, third, instructions="- Tone: formal.") == 0
+    assert third.calls == []  # cùng chỉ dẫn: dùng lại hết
+
+
+def test_an_old_meta_without_instructions_still_resumes_when_there_are_none(job):
+    source, out = job
+    (out / "segments.meta.json").write_text(json.dumps(META_LEGACY), encoding="utf-8")  # tệp Gemini dịch trước nâng cấp
+    (out / "segments.jsonl").write_text("".join(json.dumps({"src": t, "dst": "VI " + t}) + "\n" for t in LONG), encoding="utf-8")
+    transport = FakeTransport(handler=gemini_echo())
+    assert run_long(out, source, transport) == 0
+    assert transport.calls == []  # 0 lời gọi API: dựng lại font không trả tiền lại
+    assert json.loads((out / "segments.meta.json").read_text(encoding="utf-8")) == META  # viết lại meta có khoá mới
+
+
+def test_an_old_meta_without_instructions_does_not_resume_when_there_are_some(job):
+    source, out = job
+    (out / "segments.meta.json").write_text(json.dumps(META_LEGACY), encoding="utf-8")
+    (out / "segments.jsonl").write_text("".join(json.dumps({"src": t, "dst": "VI " + t}) + "\n" for t in LONG), encoding="utf-8")
+    transport = FakeTransport(handler=gemini_echo())
+    assert run_long(out, source, transport, instructions="- Tone: warm.") == 0
+    assert len(transport.calls) == 3  # meta cũ = chỉ dẫn "": bảng cũ không khớp chỉ dẫn mới → dịch lại đủ 3 lô
+
+
+def test_main_passes_the_instructions_from_the_environment_to_run_and_to_the_provider(job, monkeypatch):
+    source, out = job
+    for name, value in (("TRANSLATE_PROVIDER", "gemini"), ("TRANSLATE_API_KEY", "AIza-x"), ("TRANSLATE_MODEL", "m"),
+                        ("TRANSLATE_INSTRUCTIONS", "- Tone: warm.")):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(sys, "argv", ["handoff_worker.py", str(source), str(out), "vi"])
+    monkeypatch.setitem(sys.modules, "translate_pdf", types.SimpleNamespace(translate_pdf=lambda *args, **kwargs: None))
+    recorded: dict = {}
+    monkeypatch.setattr("app.providers.client.translate_segments", lambda *args, **kwargs: recorded.update(kwargs) or {})
+    seen: dict = {}
+
+    def fake_run(*args, **kwargs):
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("app.engine.handoff_worker.run", fake_run)
+    assert main() == 0
+    assert seen["instructions"] == "- Tone: warm."
+    seen["translate"]("gemini", "AIza-x", "m", "vi", ["x"], lambda done, total: None, None, instructions="- Tone: warm.")
+    assert recorded["instructions"] == "- Tone: warm."
+
+
+def test_instructions_never_reach_stderr_or_the_job_message_when_gemini_fails(job, capsys):
+    """Chỉ dẫn là nội dung người dùng: lỗi nhà cung cấp / trả lời hỏng không được kéo nó ra stderr hay `error`."""
+    source, out = job
+    text = "Style requirements…\n- Additional instructions from the user (about style only): «MARKER-7f3a»"
+    emitted = []
+    unparsable = FakeTransport((200, gemini_reply(["only one"])), GOOGLE_ERRORS["gemini_service_disabled"])
+    code = run(source, out, "vi", provider="gemini", api_key="AIza-x", model="gemini-3.5-flash-lite",
+               translate_pdf=fake_core([]), translate=real_translate(unparsable), emit=emitted.append, instructions=text)
+    captured = capsys.readouterr()
+    assert code == 1 and emitted[-1]["code"] == "api_not_enabled"
+    assert "reply=unparsable" in captured.err  # dòng chẩn đoán của lô hỏng vẫn có, chỉ không mang chỉ dẫn
+    assert "MARKER-7f3a" not in captured.err + captured.out + json.dumps(emitted)
+    assert "MARKER-7f3a" in unparsable.calls[0]["json"]["systemInstruction"]["parts"][0]["text"]  # nhưng có tới Gemini

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { errorText, t } from './t';
+import { ENUM_FIELDS } from '../files/profiles';
+import { errorText, t, type MessageKey } from './t';
 
 describe('t', () => {
   it('interpolates variables', () => {
@@ -25,5 +26,23 @@ describe('provider error codes (real cause instead of "key bị từ chối")', 
   it('have their own wording', () => {
     expect(errorText('model_unavailable')).toBe('Model này không còn dùng được.');
     expect(errorText('rate_limited')).toBe('Dịch vụ đang giới hạn tốc độ của key này. Thử lại sau ít phút.');
+  });
+});
+
+describe('invalid_style / invalid_profile name the field by its on-screen label, never the raw key', () => {
+  const cases: [string, string, MessageKey][] = [
+    ...ENUM_FIELDS.map((field): [string, string, MessageKey] => ['invalid_style', field, `profiles.field.${field}` as MessageKey]),
+    ['invalid_style', 'custom_instructions', 'profiles.field.custom_instructions'],
+    ['invalid_style', 'context', 'upload.advanced.context'],
+    ['invalid_style', 'style', 'profiles.fieldGeneric'],
+    ['invalid_style', 'glossary', 'profiles.fieldGeneric'],
+    ['invalid_profile', 'name', 'profiles.form.name'],
+    ['invalid_profile', 'tone', 'profiles.field.tone'],
+    ['invalid_profile', 'custom_instructions', 'profiles.field.custom_instructions'],
+  ];
+  it.each(cases)('%s field=%s', (code, field, label) => {
+    const text = errorText(code, { field });
+    expect(text).toBe(t(`error.${code}` as MessageKey, { field: t(label) }));
+    expect(text).not.toContain(field);
   });
 });

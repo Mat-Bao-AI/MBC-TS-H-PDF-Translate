@@ -43,6 +43,13 @@ export function AdminOnly({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+/** Trong RequireAuth: tắt Chế độ nâng cao mà gõ thẳng URL tab Hồ sơ dịch → về tab Dịch thuật (spec 2026-10-14 §8). */
+export function AdvanceOnly({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  if (!user?.advance_mode) return <Navigate to="/settings/translation" replace />;
+  return <>{children}</>;
+}
+
 /** Route công khai (verify-email, confirm-email, forgot/reset-password): chưa cài đặt thì cũng về /setup. */
 export function SetupGate({ children }: { children: ReactNode }) {
   const { instance, loading } = useAuth();

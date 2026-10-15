@@ -266,3 +266,109 @@ def test_wrong_method_has_the_standard_shape(client):
     response = client.get("/api/auth/logout")
     assert response.status_code == 405
     assert response.json() == {"detail": {"code": "method_not_allowed"}}
+
+
+def _seed_0007(url: str):
+    _upgrade_to(url, "0007")
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO users (id, email, password_hash, created_at, default_engine) "
+                                "VALUES ('u1', 'cu@example.com', 'x', '2026-10-01 00:00:00', 'gemini')"))
+        connection.execute(text(
+            "INSERT INTO files (id, user_id, filename, search_name, language, status, done_pages, total_pages, "
+            "untranslated, message, output_name, created_at, engine, stage) VALUES ('f1', 'u1', 'a.pdf', 'a.pdf', 'vi', "
+            "'done', 2, 2, 0, 'Xong', 'a-vi.pdf', '2026-10-01 00:00:00', 'gemini', '')"))
+    return engine
+
+
+def test_upgrade_from_0007_adds_advance_mode_defaults_and_empty_version_tables(tmp_path):
+    url = f"sqlite:///{tmp_path / 'cu.db'}"
+    engine = _seed_0007(url)
+    upgrade_db(url)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT advance_mode, default_profile FROM users")).all() == [(0, None)]
+        assert connection.execute(text("SELECT config, retranslate_config, version_no FROM files")).all() == [(None, None, 1)]
+        assert connection.execute(text("SELECT max_versions FROM instance_settings")).all() == [(None,)]
+        assert connection.execute(text("SELECT count(*) FROM translation_profiles")).scalar() == 0
+        assert connection.execute(text("SELECT count(*) FROM file_versions")).scalar() == 0
+    engine.dispose()
+
+
+def test_downgrade_from_0008_keeps_existing_rows(tmp_path):
+    url = f"sqlite:///{tmp_path / 'cu.db'}"
+    engine = _seed_0007(url)
+    upgrade_db(url)
+    config = Config()
+    config.set_main_option("script_location", str(MIGRATIONS))
+    config.set_main_option("sqlalchemy.url", url)
+    command.downgrade(config, "0007")
+    tables = set(inspect(engine).get_table_names())
+    assert "translation_profiles" not in tables and "file_versions" not in tables
+    assert "advance_mode" not in {column["name"] for column in inspect(engine).get_columns("users")}
+    assert "config" not in {column["name"] for column in inspect(engine).get_columns("files")}
+    assert "max_versions" not in {column["name"] for column in inspect(engine).get_columns("instance_settings")}
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT id, email FROM users")).all() == [("u1", "cu@example.com")]
+        assert connection.execute(text("SELECT id, status, output_name FROM files")).all() == [("f1", "done", "a-vi.pdf")]
+    engine.dispose()
+
+
+def _seed_0008(url: str):
+    _upgrade_to(url, "0008")
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO users (id, email, password_hash, created_at, default_engine) "
+                                "VALUES ('u1', 'cu@example.com', 'x', '2026-10-01 00:00:00', 'gemini')"))
+        for file_id, status in (("f1", "done"), ("f2", "error")):
+            connection.execute(text(
+                "INSERT INTO files (id, user_id, filename, search_name, language, status, done_pages, total_pages, untranslated, "
+                "message, output_name, created_at, finished_at, engine, stage) VALUES "
+                f"('{file_id}', 'u1', '{file_id}.pdf', '{file_id}.pdf', 'vi', '{status}', 2, 2, 0, 'x', 'a-vi.pdf', "
+                "'2026-10-01 00:00:00', '2026-10-02 03:04:05', 'gemini', '')"))
+        connection.execute(text(
+            "INSERT INTO file_versions (id, file_id, version_no, language, engine, font, output_name, untranslated, archived_at) "
+            "VALUES ('v1', 'f1', 1, 'vi', 'google_free', 'auto', 'a-vi.pdf', 0, '2026-10-03 00:00:00')"))
+        connection.execute(text(
+            "INSERT INTO translation_profiles (id, user_id, name, fidelity, tone, audience, terms, proper_names, numbers, dates, "
+            "abbreviations, created_at, updated_at) VALUES ('p1', 'u1', 'Riêng', 'balanced', 'professional', 'self', 'translate', "
+            "'keep', 'target_convention', 'target_convention', 'keep', '2026-10-01 00:00:00', '2026-10-01 00:00:00')"))
+    return engine
+
+
+def test_upgrade_from_0008_backfills_translated_at_for_done_files_and_adds_the_restore_columns(tmp_path):
+    url = f"sqlite:///{tmp_path / 'cu.db'}"
+    engine = _seed_0008(url)
+    upgrade_db(url)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT id, translated_at, restore_version, restored_from FROM files ORDER BY id")).all() == [
+            ("f1", "2026-10-02 03:04:05", None, None), ("f2", None, None, None)]  # tệp lỗi: có finished_at nhưng không có bản dịch
+        assert connection.execute(text("SELECT translated_at, restored_from FROM file_versions")).all() == [(None, None)]
+        assert connection.execute(text("SELECT preset_slug FROM translation_profiles")).all() == [(None,)]
+        assert connection.execute(text("SELECT profiles_seeded FROM users")).all() == [(0,)]
+    indexes = {index["name"]: index for index in inspect(engine).get_indexes("translation_profiles")}
+    seeded = indexes["uq_translation_profiles_user_preset"]  # một dòng gieo cho mỗi (người, mẫu)
+    assert (seeded["column_names"], bool(seeded["unique"])) == (["user_id", "preset_slug"], True)
+    engine.dispose()
+
+
+def test_downgrade_from_0009_keeps_existing_rows(tmp_path):
+    url = f"sqlite:///{tmp_path / 'cu.db'}"
+    engine = _seed_0008(url)
+    upgrade_db(url)
+    config = Config()
+    config.set_main_option("script_location", str(MIGRATIONS))
+    config.set_main_option("sqlalchemy.url", url)
+    command.downgrade(config, "0008")
+
+    def columns(table):
+        return {column["name"] for column in inspect(engine).get_columns(table)}
+
+    assert not {"restore_version", "restored_from", "translated_at"} & columns("files")
+    assert not {"restored_from", "translated_at"} & columns("file_versions")
+    assert "preset_slug" not in columns("translation_profiles") and "profiles_seeded" not in columns("users")
+    assert "uq_translation_profiles_user_preset" not in {index["name"] for index in inspect(engine).get_indexes("translation_profiles")}
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT id FROM files ORDER BY id")).all() == [("f1",), ("f2",)]
+        assert connection.execute(text("SELECT id FROM file_versions")).all() == [("v1",)]
+        assert connection.execute(text("SELECT id, name FROM translation_profiles")).all() == [("p1", "Riêng")]
+    engine.dispose()

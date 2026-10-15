@@ -85,7 +85,15 @@ Cài trên instance không đặt `APP_BASE_URL`: `/setup` ghi lại địa ch�
     docker rm pdf-translate
     # rồi chạy lại đúng lệnh `docker run -d --name pdf-translate …` ở "Lệnh dựng & chạy"; SECRET_KEY phải là giá trị cũ
 
-- Migration chạy tự động lúc khởi động (`upgrade_db` → alembic `head`, `backend/app/main.py` lifespan, `backend/app/db.py`). Bản mới nhất hiện có là `0007_instance_site_url`.
+- Migration chạy tự động lúc khởi động (`upgrade_db` → alembic `head`, `backend/app/main.py` lifespan, `backend/app/db.py`). Bản mới nhất hiện có là `0009_versions_restore_profiles_seed`.
+- Từ `0008` mỗi tệp có thể giữ các bản dịch cũ (`file_versions`, tệp ở `/data/users/<user>/<file>/versions/`). **Lùi về trước `0008`**
+  (khôi phục bản sao lưu DB cũ) làm mất danh sách bản cũ trong DB; thư mục `versions/` trên đĩa trở thành rác vô hại — xoá tệp sẽ dọn
+  theo. Số bản giữ lại đặt ở Cài đặt › Hệ thống (1–10, mặc định 3, tính cả bản hiện tại).
+- Từ `0009` (đợt 1b): bản cũ mang theo bảng đoạn đã dịch (`versions/<id>/segments.*`), có giờ dịch (`translated_at`) và có thể được
+  **khôi phục** thành bản mới nhất (nút "Phiên bản cũ (N)" ở trang chi tiết → trang Phiên bản); 5 hồ sơ mẫu được chép thành hồ sơ riêng
+  lần đầu bật Chế độ nâng cao (`translation_profiles.preset_slug`, `users.profiles_seeded`), kèm chỉ mục duy nhất
+  `(user_id, preset_slug)`. **Lùi về `0008`** (downgrade bỏ bảy cột và chỉ mục này) mất nhãn "khôi phục từ", giờ dịch của bản, cờ
+  gieo và liên kết hồ sơ–mẫu (5 dòng đã gieo thành hồ sơ riêng thường); không mất tệp.
 - **Dữ liệu khách có mất không: không**, miễn volume `/data` được giữ. Mất `/data` = mất tài khoản + tệp (xem (a) ở "Lỗi thường gặp").
 - **Đổi `SECRET_KEY` thì API key (Gemini / Cloud Translation) và mật khẩu SMTP đã lưu trong DB không giải mã được.** Phải nhập lại API key ở Cài đặt › Dịch thuật và mật khẩu SMTP ở Cài đặt › Hệ thống. Tài khoản, mật khẩu đăng nhập và tệp không bị ảnh hưởng (`docs/DEPLOY.md`, "Đổi SECRET_KEY").
 

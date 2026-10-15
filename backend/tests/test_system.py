@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import update
 
 from app.models import User
-from app.system.store import instance_row, seal_smtp_password
+from app.system.store import effective_max_versions, instance_row, seal_smtp_password
 from helpers import bare_client, fake_smtp, login_admin
 
 SMTP = {"host": "smtp.example.com", "port": 587, "security": "starttls", "username": "u", "password": "mat-khau-smtp",
@@ -117,6 +117,27 @@ def test_limit_out_of_range_is_refused(client, admin, limit):
     response = put(client, max_pending_per_user=limit, registration_open=False)
     assert response.status_code == 422 and response.json() == {"detail": {"code": "invalid_limit"}}
     assert get(client).json()["registration_open"] is True  # cả thẻ không ghi gì
+
+def test_max_versions_defaults_to_three_and_is_saved_kept_or_reset(client, admin):
+    body = get(client).json()
+    assert (body["max_versions"], body["max_versions_default"]) == (None, 3)
+    assert put(client, max_versions=5).json()["max_versions"] == 5
+    assert put(client, registration_open=True).json()["max_versions"] == 5  # không nhắc tới → giữ nguyên
+    assert put(client, max_versions=None).json()["max_versions"] is None  # null = về mặc định
+    with client.app.state.session_factory() as db:
+        assert effective_max_versions(db) == 3
+        instance_row(db).max_versions = 1
+        db.commit()
+        assert effective_max_versions(db) == 1
+
+
+@pytest.mark.parametrize("value", [0, 11, -1, True, "5", 2.5])
+def test_max_versions_out_of_range_is_refused_and_nothing_is_written(client, admin, value):
+    response = put(client, max_versions=value, registration_open=False, max_pending_per_user=7)
+    assert response.status_code == 422 and response.json() == {"detail": {"code": "invalid_max_versions"}}
+    body = get(client).json()
+    assert (body["registration_open"], body["max_pending_per_user"], body["max_versions"]) == (True, None, None)  # cả thẻ không ghi gì
+
 
 
 def test_delete_smtp_returns_to_env_or_none(settings):

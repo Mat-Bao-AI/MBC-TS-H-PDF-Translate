@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FileItem } from '../api/files';
 import { resetMetaCache } from '../files/useMeta';
 import { t } from '../i18n/t';
-import { META, SETTINGS, SIGNED_IN, fileItem } from '../test/fixtures';
+import { META, SETTINGS, SIGNED_IN, fileItem, fileVersion, snapshot } from '../test/fixtures';
 import { holdRequests, mockApi, sequence } from '../test/mockApi';
 import { renderApp } from '../test/render';
 import { FileDetailPage } from './FileDetailPage';
@@ -66,6 +66,57 @@ describe('FileDetailPage loading', () => {
 });
 
 describe('FileDetailPage', () => {
+  it('links to the versions page when there are old versions, shows the current configuration and says what it was restored from', async () => {
+    const versions = [fileVersion({ id: 'v00000000001', version_no: 1 }), fileVersion({ id: 'v00000000002', version_no: 2 })];
+    const item = fileItem({ status: 'done', version_no: 3, restored_from: 1, engine: 'gemini', model: 'gemini-3.8-flash', font_used: 'sans',
+      config: snapshot(), versions });
+    mockApi({ ...SIGNED_IN, 'GET /api/meta': { body: META }, [ONE]: { body: item } });
+    renderDetail();
+    const link = await screen.findByRole('link', { name: t('detail.versionsButton', { n: 2 }) });
+    expect(link).toHaveAttribute('href', '/files/f00000000001/versions');
+    expect(screen.getByText(new RegExp(t('detail.restoredFrom', { k: 1 })))).toBeInTheDocument(); // dòng mô tả
+    expect(screen.queryByTestId('versions-panel')).not.toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole('button', { name: t('detail.currentConfig') }));
+    const config = within(await screen.findByTestId('current-config'));
+    expect(config.getByText('Tài liệu kỹ thuật')).toBeInTheDocument();
+    expect(config.getByText(t('profiles.value.terms.keep'))).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: t('action.downloadTranslated') })).toHaveAttribute('href', '/api/files/f00000000001/download?kind=translated');
+  });
+
+  it('shows the restoring banner without a progress bar while a version is being restored, keeping the current translation usable', async () => {
+    const item = fileItem({
+      status: 'running', version_no: 3, done_pages: 0, total_pages: 0, rebuild_font: 'serif', retranslating: true, restoring: true,
+      restore_version: 'v00000000001', retranslate_to: { language: 'en', engine: 'gemini', model: 'gemini-3.8-flash', font: 'serif' },
+      versions: [fileVersion({ id: 'v00000000001', version_no: 1 }), fileVersion({ id: 'v00000000002', version_no: 2 })],
+    });
+    mockApi({ ...SIGNED_IN, 'GET /api/meta': { body: META }, [ONE]: { body: item } });
+    renderDetail();
+    expect(await screen.findByText(t('restore.running', { k: 1 }))).toBeInTheDocument();
+    expect(screen.queryByText(t('retranslate.running', { target: `Tiếng Anh · Gemini 3.8 Flash · ${t('font.serif')}` }))).not.toBeInTheDocument();
+    expect(screen.queryByText(t('detail.starting'))).not.toBeInTheDocument(); // không thanh tiến độ / dòng bước
+    expect(screen.getByRole('link', { name: t('action.downloadTranslated') })).toHaveAttribute('href', '/api/files/f00000000001/download?kind=translated');
+    expect(screen.getByRole('tab', { name: t('viewer.translated') })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: t('detail.versionsButton', { n: 2 }) })).toBeInTheDocument();
+  });
+
+  it('never shows a placeholder in the restoring banner when the source version is no longer listed', async () => {
+    const item = fileItem({ status: 'queued', version_no: 3, retranslating: true, restoring: true, restore_version: 'v0000000gone', versions: [] });
+    mockApi({ ...SIGNED_IN, 'GET /api/meta': { body: META }, [ONE]: { body: item } });
+    renderDetail();
+    expect(await screen.findByText(t('restore.runningUnknown'))).toBeInTheDocument();
+    expect(screen.queryByText(/\?/)).not.toBeInTheDocument();
+  });
+
+  it('has no versions link or version number for a file that was never retranslated', async () => {
+    mockApi({ ...SIGNED_IN, 'GET /api/meta': { body: META }, [ONE]: { body: fileItem({ status: 'done', versions: [] }) } });
+    renderDetail();
+    await screen.findByRole('heading', { level: 1, name: 'Báo cáo.pdf' });
+    const toVersions = [...screen.queryAllByRole('link'), ...screen.queryAllByRole('button')]
+      .filter((element) => element.getAttribute('href') === '/files/f00000000001/versions');
+    expect(toVersions).toHaveLength(0);
+    expect(screen.queryByText(new RegExp(t('file.version', { n: 1 })))).not.toBeInTheDocument();
+  });
+
   it('shows a breadcrumb back to the list and the file name as the page title', async () => {
     mockApi({ ...SIGNED_IN, 'GET /api/meta': { body: META }, [ONE]: { body: fileItem({ status: 'done' }) } });
     renderDetail();

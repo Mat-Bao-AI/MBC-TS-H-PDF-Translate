@@ -13,9 +13,10 @@ export type SmtpBody = { host: string; port: number; security: SmtpSecurity; use
 export type SiteUrlSource = 'env' | 'setup';
 export type SystemSettings = {
   smtp: SmtpInfo; registration_open: boolean; max_pending_per_user: number | null; max_pending_default: number;
+  max_versions: number | null; max_versions_default: number;
   site_url: string | null; site_url_source: SiteUrlSource | null;
 };
-export type SystemSettingsBody = { smtp?: SmtpBody; registration_open?: boolean; max_pending_per_user?: number | null };
+export type SystemSettingsBody = { smtp?: SmtpBody; registration_open?: boolean; max_pending_per_user?: number | null; max_versions?: number | null };
 
 /** /api/system/* — chỉ quản trị viên (403 admin_required với người thường). */
 export const systemApi = {

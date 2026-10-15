@@ -5,8 +5,11 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetMetaCache } from '../files/useMeta';
 import { t } from '../i18n/t';
-import { META, SETTINGS, SETTINGS_WITH_GEMINI, fileItem, settingsWith } from '../test/fixtures';
-import { mockApi } from '../test/mockApi';
+import { STYLE_FIELDS, fieldLabel, styleOf } from '../files/profiles';
+import { TRANSLATION_SETTINGS_CACHE_KEY } from '../api/settings';
+import { cacheGet, cacheSet } from '../lib/swrCache';
+import { META, MY_PROFILE, SEEDED_PROFILES, SETTINGS, SETTINGS_WITH_GEMINI, fileItem, settingsWith } from '../test/fixtures';
+import { bodies, holdRequests, mockApi, type Call } from '../test/mockApi';
 import { UploadModal } from './UploadModal';
 
 const pdf = (name = 'Báo cáo.pdf', size = 10) => new File([new Uint8Array(size)], name, { type: 'application/pdf' });
@@ -26,7 +29,8 @@ function renderModal(initialFile?: File) {
 
 // applyAccept: false — để thử được cả tệp .txt mà ô chọn tệp vốn lọc bỏ.
 const setupUser = () => userEvent.setup({ applyAccept: false });
-const postedForm = (calls: { method: string; body: unknown }[]) => calls.find((call) => call.method === 'POST')!.body as FormData;
+const postedForm = (calls: Call[]) => calls.find((call) => call.method === 'POST' && call.url === '/api/files')!.body as FormData;
+const TECHNICAL = SEEDED_PROFILES[2];
 // "Dịch" chỉ bấm được khi yêu cầu cài đặt đã xong (thành công hay lỗi).
 const submitReady = async () => {
   const button = screen.getByRole('button', { name: t('upload.submit') });
@@ -288,5 +292,238 @@ describe('UploadModal', () => {
     expect(getComputedStyle(actions).position).toBe('sticky');
     expect(actions).toContainElement(submit);
     expect(actions).toContainElement(screen.getByRole('button', { name: t('common.cancel') }));
+  });
+  it('shows the advanced section in advanced mode with an AI engine and sends only the changed fields', async () => {
+    const settings = settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true, default_profile: 'preset:technical' });
+    const { calls } = mockApi({ ...BASE, 'GET /api/settings': { body: settings }, 'POST /api/files': { status: 202, body: fileItem() } });
+    renderModal();
+    const user = setupUser();
+    expect(await screen.findByLabelText(t('upload.advanced.profile'))).toHaveValue('preset:technical');
+    expect(screen.queryByLabelText(t('profiles.field.tone'))).not.toBeInTheDocument();
+    await user.click(screen.getByRole('checkbox', { name: t('upload.advanced.customize') }));
+    expect(screen.getByLabelText(t('profiles.field.terms'))).toHaveValue('keep'); // điền sẵn từ hồ sơ
+    await user.selectOptions(screen.getByLabelText(t('profiles.field.tone')), 'friendly');
+    await user.type(screen.getByLabelText(t('upload.advanced.context')), 'Tài liệu API nội bộ.');
+    expect(screen.getByText(t('profiles.form.counter', { n: 'Tài liệu API nội bộ.'.length, max: 2000 }))).toBeInTheDocument();
+    await user.upload(screen.getByTestId('file-input'), pdf());
+    await user.click(await submitReady());
+    await vi.waitFor(() => expect(calls.filter((call) => call.method === 'POST')).toHaveLength(1));
+    const form = postedForm(calls);
+    expect(form.get('engine')).toBe('gemini');
+    expect(form.get('profile')).toBe('preset:technical');
+    expect(JSON.parse(String(form.get('style')))).toEqual({ tone: 'friendly' });
+    expect(form.get('context')).toBe('Tài liệu API nội bộ.');
+  });
+
+  it('names a refused field by its label, not the raw key', async () => {
+    const settings = settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true });
+    mockApi({ ...BASE, 'GET /api/settings': { body: settings }, 'POST /api/files': { status: 422, body: { detail: { code: 'invalid_style', field: 'context' } } } });
+    renderModal();
+    const user = setupUser();
+    await user.type(await screen.findByLabelText(t('upload.advanced.context')), 'Ngữ cảnh');
+    await user.upload(screen.getByTestId('file-input'), pdf());
+    await user.click(await submitReady());
+    expect(await screen.findByText(t('error.invalid_style', { field: t('upload.advanced.context') }))).toBeInTheDocument();
+    expect(screen.queryByText(/context/)).not.toBeInTheDocument();
+  });
+
+  it('hides the advanced section in plain mode and sends nothing advanced', async () => {
+    const settings = settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true, default_profile: 'preset:technical' });
+    const { calls } = mockApi({ ...BASE, 'GET /api/settings': { body: settings }, 'POST /api/files': { status: 202, body: fileItem() } });
+    renderModal();
+    const user = setupUser();
+    await screen.findByLabelText(t('upload.advanced.profile'));
+    await user.click(screen.getByLabelText(t('mode.plain')));
+    expect(screen.queryByTestId('upload-advanced')).not.toBeInTheDocument();
+    await user.upload(screen.getByTestId('file-input'), pdf());
+    await user.click(await submitReady());
+    await vi.waitFor(() => expect(calls.filter((call) => call.method === 'POST')).toHaveLength(1));
+    const form = postedForm(calls);
+    expect(form.get('engine')).toBe('google_free');
+    for (const key of ['profile', 'style', 'context']) expect(form.has(key)).toBe(false);
+  });
+
+  it('has no advanced section when advanced mode is off', async () => {
+    mockApi({ ...BASE, 'GET /api/settings': { body: SETTINGS_WITH_GEMINI } });
+    renderModal();
+    await screen.findByLabelText(t('mode.ai'));
+    expect(screen.queryByText(t('upload.advanced.title'))).not.toBeInTheDocument();
+  });
+
+  it('has no advanced section without a Gemini key, even in advanced mode', async () => {
+    mockApi({ ...BASE, 'GET /api/settings': { body: settingsWith({ advance_mode: true }) } });
+    renderModal();
+    await screen.findByLabelText(t('mode.plain'));
+    expect(screen.queryByTestId('upload-advanced')).not.toBeInTheDocument();
+    expect(screen.queryByText(t('upload.advanced.title'))).not.toBeInTheDocument();
+  });
+
+  it('sends no advanced keys at all when advanced mode is off, even with an AI engine', async () => {
+    const { calls } = mockApi({ ...BASE, 'GET /api/settings': { body: SETTINGS_WITH_GEMINI }, 'POST /api/files': { status: 202, body: fileItem() } });
+    renderModal();
+    const user = setupUser();
+    await screen.findByLabelText(t('mode.ai'));
+    await user.upload(screen.getByTestId('file-input'), pdf());
+    await user.click(await submitReady());
+    await vi.waitFor(() => expect(calls.filter((call) => call.method === 'POST')).toHaveLength(1));
+    const form = postedForm(calls);
+    expect(form.get('engine')).toBe('gemini');
+    for (const key of ['profile', 'style', 'context']) expect(form.has(key)).toBe(false);
+  });
+
+  it('sends no advanced keys when advanced mode is on but nothing was chosen', async () => {
+    const { calls } = mockApi({ ...BASE, 'GET /api/settings': { body: settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true }) }, 'POST /api/files': { status: 202, body: fileItem() } });
+    renderModal();
+    const user = setupUser();
+    await screen.findByLabelText(t('upload.advanced.profile'));
+    await user.upload(screen.getByTestId('file-input'), pdf());
+    await user.click(await submitReady());
+    await vi.waitFor(() => expect(calls.filter((call) => call.method === 'POST')).toHaveLength(1));
+    for (const key of ['profile', 'style', 'context']) expect(postedForm(calls).has(key)).toBe(false);
+  });
+
+  it('saves the customised fields into the selected profile and stops sending them as overrides', async () => {
+    const settings = settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true, default_profile: TECHNICAL.id, profiles: SEEDED_PROFILES });
+    cacheSet(TRANSLATION_SETTINGS_CACHE_KEY, settings);
+    const { calls } = mockApi({
+      ...BASE, 'GET /api/settings': { body: settings }, 'POST /api/files': { status: 202, body: fileItem() },
+      [`PUT /api/profiles/${TECHNICAL.id}`]: { body: { ...TECHNICAL, tone: 'friendly' } },
+    });
+    renderModal();
+    const user = setupUser();
+    expect(await screen.findByLabelText(t('upload.advanced.profile'))).toHaveValue(TECHNICAL.id);
+    await user.click(screen.getByRole('checkbox', { name: t('upload.advanced.customize') }));
+    const saveName = t('profiles.saveInto', { name: 'Tài liệu kỹ thuật' });
+    expect(screen.queryByRole('button', { name: saveName })).not.toBeInTheDocument(); // chưa khác hồ sơ
+    await user.selectOptions(screen.getByLabelText(t('profiles.field.tone')), 'friendly');
+    await user.click(screen.getByRole('button', { name: saveName }));
+    await vi.waitFor(() => expect(bodies(calls, 'PUT', `/api/profiles/${TECHNICAL.id}`)).toEqual([{ name: 'Tài liệu kỹ thuật', ...styleOf(TECHNICAL), tone: 'friendly' }]));
+    expect(await screen.findByText(t('profiles.savedInto', { name: 'Tài liệu kỹ thuật' }))).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: saveName })).not.toBeInTheDocument(); // nay bằng hồ sơ
+    expect(cacheGet(TRANSLATION_SETTINGS_CACHE_KEY)).toBeUndefined();
+    await user.upload(screen.getByTestId('file-input'), pdf());
+    await user.click(await submitReady());
+    await vi.waitFor(() => expect(calls.filter((call) => call.method === 'POST' && call.url === '/api/files')).toHaveLength(1));
+    const form = postedForm(calls);
+    expect(form.get('profile')).toBe(TECHNICAL.id);
+    expect(form.has('style')).toBe(false); // giá trị đã là của hồ sơ → không còn ghi đè
+  });
+
+  it('freezes the advanced fields while a profile save is in flight, so the upload sends what the screen shows', async () => {
+    const settings = settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true, default_profile: TECHNICAL.id, profiles: SEEDED_PROFILES });
+    const created = { ...TECHNICAL, id: 'p00000000002', name: 'Hợp đồng API', tone: 'friendly', audience: 'client', preset_slug: null };
+    const { calls, fetchMock } = mockApi({
+      ...BASE, 'GET /api/settings': { body: settings }, 'POST /api/files': { status: 202, body: fileItem() },
+      [`PUT /api/profiles/${TECHNICAL.id}`]: { body: { ...TECHNICAL, tone: 'friendly' } },
+      'POST /api/profiles': { status: 201, body: created },
+    });
+    renderModal();
+    const user = setupUser();
+    await screen.findByLabelText(t('upload.advanced.profile'));
+    await user.click(screen.getByRole('checkbox', { name: t('upload.advanced.customize') }));
+    await user.selectOptions(screen.getByLabelText(t('profiles.field.tone')), 'friendly');
+    const frozen = () => [
+      screen.getByLabelText(t('upload.advanced.profile')), screen.getByRole('checkbox', { name: t('upload.advanced.customize') }),
+      ...STYLE_FIELDS.map((field) => screen.getByLabelText(fieldLabel(field))), screen.getByLabelText(t('upload.advanced.context')),
+    ];
+    // Lưu vào hồ sơ: trong lúc chờ PUT không đổi được trường nào (đổi được thì lượt lưu xong sẽ ghi đè lên bằng giá trị lúc bấm).
+    const putHeld = holdRequests(fetchMock, `/api/profiles/${TECHNICAL.id}`);
+    const saveInto = screen.getByRole('button', { name: t('profiles.saveInto', { name: 'Tài liệu kỹ thuật' }) });
+    await user.click(saveInto);
+    await vi.waitFor(() => expect(saveInto).toBeDisabled()); // đang lưu
+    for (const control of frozen()) expect(control).toBeDisabled();
+    putHeld.release();
+    expect(await screen.findByText(t('profiles.savedInto', { name: 'Tài liệu kỹ thuật' }))).toBeInTheDocument();
+    for (const control of frozen()) expect(control).toBeEnabled();
+    // Lưu thành hồ sơ mới: cũng vậy trong lúc chờ POST.
+    await user.selectOptions(screen.getByLabelText(t('profiles.field.audience')), 'client');
+    await user.click(screen.getByRole('button', { name: t('profiles.saveAsNew') }));
+    fireEvent.change(screen.getByLabelText(t('profiles.form.name')), { target: { value: 'Hợp đồng API' } });
+    const postHeld = holdRequests(fetchMock, '/api/profiles');
+    const create = screen.getByRole('button', { name: t('profiles.create') });
+    await user.click(create);
+    await vi.waitFor(() => expect(create).toBeDisabled()); // đang lưu
+    for (const control of frozen()) expect(control).toBeDisabled();
+    postHeld.release();
+    await vi.waitFor(() => expect(screen.getByLabelText(t('upload.advanced.profile'))).toHaveValue('p00000000002'));
+    for (const control of frozen()) expect(control).toBeEnabled();
+    // Sau khi lưu: đổi tiếp trên màn hình, rồi tải lên — thân gửi đi đúng như màn hình đang hiện.
+    await user.selectOptions(screen.getByLabelText(t('profiles.field.numbers')), 'target_convention');
+    fireEvent.change(screen.getByLabelText(t('upload.advanced.context')), { target: { value: 'Hợp đồng dịch vụ.' } });
+    expect(screen.getByLabelText(t('profiles.field.tone'))).toHaveValue('friendly');
+    await user.upload(screen.getByTestId('file-input'), pdf());
+    await user.click(await submitReady());
+    await vi.waitFor(() => expect(calls.filter((call) => call.method === 'POST' && call.url === '/api/files')).toHaveLength(1));
+    const form = postedForm(calls);
+    expect(form.get('profile')).toBe('p00000000002');
+    expect(JSON.parse(String(form.get('style')))).toEqual({ numbers: 'target_convention' });
+    expect(form.get('context')).toBe('Hợp đồng dịch vụ.');
+  });
+
+  it('offers no save-into for a profile that is not one of my rows', async () => {
+    const settings = settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true, default_profile: 'preset:technical' });
+    mockApi({ ...BASE, 'GET /api/settings': { body: settings } });
+    renderModal();
+    const user = setupUser();
+    await screen.findByLabelText(t('upload.advanced.profile'));
+    await user.click(screen.getByRole('checkbox', { name: t('upload.advanced.customize') }));
+    await user.selectOptions(screen.getByLabelText(t('profiles.field.tone')), 'friendly');
+    expect(screen.queryByRole('button', { name: /^Lưu vào hồ sơ/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: t('profiles.saveAsNew') })).toBeEnabled();
+  });
+
+  it('saves the customised fields as a new profile, selects it and never opens a second dialog', async () => {
+    const settings = settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true, default_profile: TECHNICAL.id, profiles: SEEDED_PROFILES });
+    cacheSet(TRANSLATION_SETTINGS_CACHE_KEY, settings);
+    const created = { ...TECHNICAL, id: 'p00000000002', name: 'Hợp đồng API', tone: 'friendly', preset_slug: null };
+    const { calls } = mockApi({
+      ...BASE, 'GET /api/settings': { body: settings }, 'POST /api/files': { status: 202, body: fileItem() },
+      'POST /api/profiles': { status: 201, body: created },
+    });
+    renderModal();
+    const user = setupUser();
+    await screen.findByLabelText(t('upload.advanced.profile'));
+    await user.click(screen.getByRole('checkbox', { name: t('upload.advanced.customize') }));
+    await user.selectOptions(screen.getByLabelText(t('profiles.field.tone')), 'friendly');
+    await user.click(screen.getByRole('button', { name: t('profiles.saveAsNew') }));
+    const name = screen.getByLabelText(t('profiles.form.name'));
+    expect(name).toHaveValue(t('profiles.cloneName', { name: 'Tài liệu kỹ thuật' }));
+    expect(screen.getAllByRole('dialog')).toHaveLength(1); // ô tên inline, không dialog lồng dialog
+    fireEvent.change(name, { target: { value: 'Hợp đồng API' } });
+    await user.click(screen.getByRole('button', { name: t('profiles.create') }));
+    await vi.waitFor(() => expect(bodies(calls, 'POST', '/api/profiles')).toEqual([{ name: 'Hợp đồng API', ...styleOf(TECHNICAL), tone: 'friendly' }]));
+    await vi.waitFor(() => expect(screen.getByLabelText(t('upload.advanced.profile'))).toHaveValue('p00000000002')); // chọn luôn hồ sơ mới
+    expect(screen.queryByLabelText(t('profiles.form.name'))).not.toBeInTheDocument();
+    expect(cacheGet(TRANSLATION_SETTINGS_CACHE_KEY)).toBeUndefined();
+    await user.upload(screen.getByTestId('file-input'), pdf());
+    await user.click(await submitReady());
+    await vi.waitFor(() => expect(calls.filter((call) => call.method === 'POST' && call.url === '/api/files')).toHaveLength(1));
+    const form = postedForm(calls);
+    expect(form.get('profile')).toBe('p00000000002');
+    expect(form.has('style')).toBe(false);
+  });
+
+  it('shows the server reason inline when saving as a new profile is refused', async () => {
+    const settings = settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true, default_profile: TECHNICAL.id, profiles: SEEDED_PROFILES });
+    mockApi({ ...BASE, 'GET /api/settings': { body: settings }, 'POST /api/profiles': { status: 409, body: { detail: { code: 'too_many_profiles', limit: 20 } } } });
+    renderModal();
+    const user = setupUser();
+    await screen.findByLabelText(t('upload.advanced.profile'));
+    await user.click(screen.getByRole('checkbox', { name: t('upload.advanced.customize') }));
+    await user.click(screen.getByRole('button', { name: t('profiles.saveAsNew') }));
+    await user.click(screen.getByRole('button', { name: t('profiles.create') }));
+    expect(await screen.findByText(t('error.too_many_profiles', { limit: 20 }))).toBeInTheDocument();
+    expect(screen.getByLabelText(t('upload.advanced.profile'))).toHaveValue(TECHNICAL.id); // không đổi hồ sơ đang chọn
+  });
+
+  it('disables "save as a new profile" when the 20 own profiles are used up', async () => {
+    const twenty = Array.from({ length: 20 }, (_, index) => ({ ...MY_PROFILE, id: `p${String(index + 10).padStart(11, '0')}`, name: `Hồ sơ ${index + 1}` }));
+    const settings = settingsWith({ ...SETTINGS_WITH_GEMINI, advance_mode: true, default_profile: twenty[0].id, profiles: twenty });
+    mockApi({ ...BASE, 'GET /api/settings': { body: settings } });
+    renderModal();
+    const user = setupUser();
+    await screen.findByLabelText(t('upload.advanced.profile'));
+    await user.click(screen.getByRole('checkbox', { name: t('upload.advanced.customize') }));
+    expect(screen.getByRole('button', { name: t('profiles.saveAsNew') })).toBeDisabled();
   });
 });

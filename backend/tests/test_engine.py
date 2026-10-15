@@ -2,16 +2,23 @@ import json
 import sys
 import time
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.db import make_engine, make_session_factory, upgrade_db, utcnow
-from app.engine.jobs import MISSING_KEY_MESSAGE, NO_HANDOFF_WORKER_MESSAGE, JobRunner
+from app.engine.handoff_worker import instructions_digest
+from app.engine.jobs import MISSING_KEY_MESSAGE, NO_HANDOFF_WORKER_MESSAGE, RESTORE_SOURCE_MISSING_MESSAGE, JobRunner, Previous
 from app.engine.paths import file_dir, safe_name
-from app.models import ApiCredential, File, User
+from app.files.service import download_target
+from app.models import ApiCredential, File, FileVersion, User
+from app.profiles.prompt import HEADER, build_instructions
+from app.profiles.snapshot import load as load_snapshot
+from app.providers.catalog import ENGINE_BY_ID
 from app.providers.crypto import encrypt
+from app.system.store import instance_row
 from helpers import FAKE_HANDOFF_WORKER, FAKE_WORKER, PDF
 
 
@@ -47,7 +54,7 @@ def make_runner(factory, settings):
 
 
 def add_file(factory, settings, filename="doc.pdf", status="queued", engine="google_free", model=None,
-             font="auto") -> str:
+             font="auto", config=None) -> str:
     # Tệp nằm trên đĩa TRƯỚC khi có dòng trong DB — như create_file: runner tự quét DB nên
     # dòng "queued" xuất hiện là có thể bị nhận ngay.
     file_id = uuid.uuid4().hex[:12]
@@ -56,7 +63,7 @@ def add_file(factory, settings, filename="doc.pdf", status="queued", engine="goo
     (directory / safe_name(filename)).write_bytes(PDF)
     with factory() as db:
         db.add(File(id=file_id, user_id="u1", filename=filename, search_name=filename.casefold(),
-                    language="vi", status=status, engine=engine, model=model, font=font))
+                    language="vi", status=status, engine=engine, model=model, font=font, config=config))
         db.commit()
     return file_id
 
@@ -110,6 +117,17 @@ def wait_stage(factory, file_id, stage, timeout=10.0) -> File:
                 return row
         time.sleep(0.05)
     raise AssertionError(f"{file_id} không tới stage {stage}")
+
+
+def wait_gone(path, timeout=10.0) -> None:
+    """Việc dọn SAU commit của _finish_rebuild (spec 2026-10-14 §5 bước 6: rmtree kho đã tỉa → thay bảng đoạn → rmtree rebuild/)
+    chạy sau khi dòng đã `done` — đợi rebuild/ (bước cuối) biến mất, có hạn, thay vì kiểm ngay lúc thấy `done`."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not path.exists():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{path} vẫn còn sau {timeout}s")
 
 
 def test_safe_name_keeps_the_name_but_not_the_path():
@@ -475,6 +493,78 @@ def test_handoff_child_env_excludes_secret_key_and_smtp_password(factory, settin
     assert env_seen["provider"] == "gemini"  # TRANSLATE_* vẫn phải còn nguyên
 
 
+SIMPLE = json.dumps({"schema": 1, "mode": "advanced", "profile": None, "style": {"tone": "simple"}, "overrides": ["tone"],
+                     "document_context": "Sách giáo khoa."})
+ACADEMIC = json.dumps({"schema": 1, "mode": "advanced", "profile": None, "style": {"tone": "academic"}, "overrides": ["tone"],
+                       "document_context": None})
+
+
+def test_the_handoff_worker_receives_the_style_instructions_built_from_the_snapshot(factory, settings, make_runner):
+    add_credential(factory, settings, "gemini")
+    runner = make_runner()
+    runner.start()
+    file_id = add_file(factory, settings, "ai.pdf", engine="gemini", model="gemini-3.5-flash-lite", config=SIMPLE)
+    runner.enqueue(file_id)
+    assert wait_row(factory, file_id).status == "done"
+    instructions = env_seen(settings, file_id)["instructions"]
+    assert instructions.startswith(HEADER) and "- Tone: plain and simple" in instructions and "«Sách giáo khoa.»" in instructions
+
+
+def test_a_plain_engine_job_gets_no_instructions_and_a_basic_ai_job_gets_an_empty_string(factory, settings, make_runner):
+    add_credential(factory, settings, "gemini")
+    runner = make_runner()
+    runner.start()
+    plain = add_file(factory, settings, "plain.pdf", config=SIMPLE)  # snapshot lạc vào tệp thuần (không thể qua API): bị bỏ qua
+    ai = add_file(factory, settings, "ai.pdf", engine="gemini", model="gemini-3.5-flash-lite")
+    for file_id in (plain, ai):
+        runner.enqueue(file_id)
+        assert wait_row(factory, file_id).status == "done"
+    assert env_seen(settings, plain)["instructions"] is None  # font_worker không nhận biến này
+    assert env_seen(settings, ai)["instructions"] == ""
+
+
+def test_a_retranslate_builds_the_instructions_from_the_parked_snapshot_not_the_current_one(factory, settings, make_runner):
+    add_credential(factory, settings, "gemini")
+    file_id = add_retranslate(factory, settings, "fontline.pdf", engine="gemini", model="gemini-3.5-flash-lite")
+    with factory() as db:
+        row = db.get(File, file_id)
+        row.config, row.retranslate_config = SIMPLE, ACADEMIC
+        db.commit()
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    instructions = env_seen(settings, file_id)["instructions"]
+    assert "Tone: formal and precise" in instructions and "plain and simple" not in instructions
+    assert json.loads(row.config)["style"]["tone"] == "academic" and row.retranslate_config is None  # đổi chỗ khi xong (Task 3)
+
+
+def test_a_font_rebuild_builds_the_instructions_from_the_current_snapshot(factory, settings, make_runner):
+    add_credential(factory, settings, "gemini")
+    file_id = add_translated(factory, settings, "fontline.pdf", rebuild_font="serif", engine="gemini", model="gemini-3.5-flash-lite")
+    with factory() as db:
+        db.get(File, file_id).config = SIMPLE
+        db.commit()
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert row.status == "done" and json.loads(row.config) == json.loads(SIMPLE)
+    assert "- Tone: plain and simple" in env_seen(settings, file_id)["instructions"]
+
+
+def test_the_digest_the_fake_worker_writes_is_the_real_digest_of_the_instructions_the_runner_built(factory, settings, make_runner):
+    """Chốt chống lệch: fake_handoff_worker tự lặp logic băm — phải khớp handoff_worker.instructions_digest thật."""
+    add_credential(factory, settings, "gemini")
+    file_id = add_retranslate(factory, settings, "newtable.pdf", engine="gemini", model="gemini-3.5-flash-lite")
+    with factory() as db:
+        db.get(File, file_id).retranslate_config = SIMPLE
+        db.commit()
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    make_runner().start()
+    assert wait_row(factory, file_id).status == "done"
+    wait_gone(directory / "rebuild")  # bảng mới thay vào thư mục job SAU commit
+    instructions = env_seen(settings, file_id)["instructions"]
+    meta = json.loads((directory / "segments.meta.json").read_text(encoding="utf-8"))
+    assert instructions and meta["instructions"] == instructions_digest(instructions)
+
+
 # ---- Font bản dịch + dựng lại (spec 2026-10-02 §6) ---------------------------------------------
 
 def add_translated(factory, settings, filename="doc.pdf", *, rebuild_font="serif", status="queued", engine="google_free",
@@ -532,7 +622,7 @@ def test_a_rebuild_replaces_the_translation_from_a_staging_folder(factory, setti
     assert (row.status, row.message, row.output_name) == ("done", "Xong", "fontline-vi.pdf")
     assert (row.font, row.font_used, row.rebuild_font, row.rebuild_error, row.untranslated) == ("serif", "serif", None, "", 0)
     assert (directory / "fontline-vi.pdf").read_bytes().endswith(b"% rebuilt font=serif\n")
-    assert not (directory / "rebuild").exists()
+    wait_gone(directory / "rebuild")  # rmtree rebuild/ chạy SAU commit
     seen = env_seen(settings, file_id)
     assert seen["font"] == "serif" and seen["argv"][1] == str(directory / "rebuild")
 
@@ -946,7 +1036,8 @@ def test_a_retranslate_runs_in_staging_with_the_new_choice_and_without_the_old_t
     assert seen["argv"][1:] == [str(directory / "rebuild"), "en"]
     assert seen["table_seen"] is False  # KHÔNG chép bảng cũ vào staging: dịch từ đầu đúng quyết định của người dùng
     assert (directory / "fontline-en.pdf").read_bytes().endswith(b"% rebuilt font=sans\n")
-    assert not (directory / "fontline-vi.pdf").exists() and not (directory / "rebuild").exists()
+    wait_gone(directory / "rebuild")  # thay bảng + rmtree rebuild/ chạy SAU commit (spec 2026-10-14 §5 bước 6)
+    assert not (directory / "fontline-vi.pdf").exists()
     # Bảng cũ thuộc lựa chọn cũ: bị thay hẳn — worker không ghi bảng mới thì không còn bảng nào.
     assert not (directory / "segments.jsonl").exists() and not (directory / "segments.meta.json").exists()
 
@@ -958,9 +1049,10 @@ def test_a_retranslate_replaces_the_old_table_with_the_new_one_without_merging(f
     make_runner().start()
     row = wait_row(factory, file_id)
     assert (row.status, row.language, row.engine) == ("done", "en", "gemini")
+    wait_gone(directory / "rebuild")  # thay bảng chạy SAU commit, trước bước cuối rmtree rebuild/
     assert (directory / "segments.jsonl").read_text(encoding="utf-8") == '{"src": "x", "dst": "y"}\n'  # không nối "old\n"
     assert json.loads((directory / "segments.meta.json").read_text(encoding="utf-8")) == {
-        "provider": "gemini", "model": "gemini-3.5-flash-lite", "target_language": "en"}
+        "provider": "gemini", "model": "gemini-3.5-flash-lite", "target_language": "en", "instructions": ""}
 
 
 def test_a_failed_retranslate_keeps_the_old_translation_and_table(factory, settings, make_runner):
@@ -1007,8 +1099,8 @@ def test_recovery_keeps_the_retranslate_request_and_its_staged_table(factory, se
     assert seen["table_seen"] is True  # bảng dở của CHÍNH lượt dịch lại được giữ cho worker handoff tiếp tục
     # Worker chỉ thấy bảng đã trả tiền (+ log stderr runner mở trước khi chạy): tệp/thư mục rác của lượt dở đã bị dọn.
     assert seen["out_dir_listing"] == ["segments.jsonl", "segments.meta.json", "worker-stderr.log"]
+    wait_gone(directory / "rebuild")  # thay bảng + rmtree rebuild/ chạy SAU commit
     assert (directory / "segments.jsonl").read_text(encoding="utf-8") == '{"src": "paid", "dst": "tra-tien"}\n'  # và thay hẳn bảng cũ
-    assert not (directory / "rebuild").exists()
 
 
 def test_a_retranslate_without_a_rebuild_font_still_runs_staged_with_the_files_font(factory, settings, make_runner):
@@ -1028,7 +1120,8 @@ def test_a_retranslate_without_a_rebuild_font_still_runs_staged_with_the_files_f
     seen = env_seen(settings, file_id)
     assert (seen["argv"][1], seen["font"]) == (str(directory / "rebuild"), "auto")
     assert (directory / "fontline-en.pdf").read_bytes().endswith(b"% rebuilt font=auto\n")
-    assert not (directory / "fontline-vi.pdf").exists() and not (directory / "rebuild").exists()
+    wait_gone(directory / "rebuild")  # thay bảng + rmtree rebuild/ chạy SAU commit
+    assert not (directory / "fontline-vi.pdf").exists()
     assert not (directory / "segments.jsonl").exists()  # bảng cũ thuộc lựa chọn cũ: bị thay như mọi lượt dịch lại
 
 
@@ -1059,7 +1152,7 @@ def test_a_retranslate_keeps_the_old_translation_table_and_labels_when_the_datab
     file_id = add_retranslate(factory, settings, "newtable.pdf", engine="gemini", model="gemini-3.5-flash-lite")
     directory = file_dir(settings.users_dir, "u1", file_id)
     runner = make_runner()
-    flaky_first_update(runner, monkeypatch)  # ghi DB của _finish_rebuild hỏng SAU khi bản mới (tên khác) đã được chép vào
+    fail_commit_swap(runner, monkeypatch)  # giao dịch ghi của lượt dịch lại hỏng SAU khi bản mới (tên khác) đã được chép vào
     runner.start()
     row = wait_row(factory, file_id)
     assert (row.status, row.output_name, row.language, row.engine, row.model, row.font) == (
@@ -1071,3 +1164,837 @@ def test_a_retranslate_keeps_the_old_translation_table_and_labels_when_the_datab
     # Bảng chỉ được thay SAU khi DB đã trỏ sang lựa chọn mới; lỗi nội bộ cũng không trả bảng mới về job.
     assert (directory / "segments.jsonl").read_text(encoding="utf-8") == "old\n"
     assert (directory / "segments.meta.json").read_text(encoding="utf-8") == "meta\n"
+
+
+# ---- Phiên bản (spec 2026-10-14 §5) -----------------------------------------------------------------------------
+
+
+def versions_of(factory, file_id) -> list[FileVersion]:
+    with factory() as db:
+        return list(db.scalars(select(FileVersion).where(FileVersion.file_id == file_id).order_by(FileVersion.version_no)).all())
+
+
+def set_max_versions(factory, value) -> None:
+    with factory() as db:
+        instance_row(db).max_versions = value
+        db.commit()
+
+
+def requeue_retranslate(factory, file_id, *, language="en", engine="google_free", model=None, font="serif") -> None:
+    """Tệp đã xong được yêu cầu dịch lại lần nữa — như files.service._queue_retranslate nhánh done."""
+    with factory() as db:
+        row = db.get(File, file_id)
+        row.retranslate_language, row.retranslate_engine, row.retranslate_model, row.rebuild_font = language, engine, model, font
+        row.status, row.done_pages, row.total_pages, row.message, row.stage = "queued", 0, 0, "", ""
+        db.commit()
+
+
+def fail_commit_swap(runner, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk full")  # giao dịch ghi của lượt dịch lại hỏng SAU khi đã cất bản cũ / chép bản mới
+
+    monkeypatch.setattr(runner, "_commit_swap", boom)
+
+
+def version_dirs(directory) -> list[str]:
+    store = directory / "versions"
+    return sorted(child.name for child in store.iterdir()) if store.exists() else []
+
+
+def seed_version(factory, directory, file_id, *, version_no=1, output_name="archived-en.pdf") -> str:
+    """Kho đã có một bản cũ (dòng + tệp) từ lượt dịch lại trước; bản hiện tại thành "Bản version_no + 1"."""
+    version_id = uuid.uuid4().hex[:12]
+    (directory / "versions" / version_id).mkdir(parents=True)
+    (directory / "versions" / version_id / output_name).write_bytes(b"archived v1")
+    with factory() as db:
+        db.add(FileVersion(id=version_id, file_id=file_id, version_no=version_no, language="en", engine="google_free", font="auto",
+                           output_name=output_name, untranslated=0, archived_at=utcnow()))
+        db.get(File, file_id).version_no = version_no + 1
+        db.commit()
+    return version_id
+
+
+def test_a_retranslate_archives_the_previous_translation_as_a_version(factory, settings, make_runner):
+    add_credential(factory, settings, "gemini")
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en", engine="gemini", model="gemini-3.8-flash", font="sans",
+                              old_engine="gemini", old_model="gemini-3.5-flash-lite")
+    with factory() as db:
+        row = db.get(File, file_id)
+        row.config, row.retranslate_config = SIMPLE, ACADEMIC
+        db.commit()
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.version_no, row.config, row.retranslate_config) == ("done", "fontline-en.pdf", 2, ACADEMIC, None)
+    [version] = versions_of(factory, file_id)
+    assert (version.version_no, version.language, version.engine, version.model, version.font, version.font_used, version.untranslated) == (
+        1, "vi", "gemini", "gemini-3.5-flash-lite", "auto", "sans", 2)
+    assert version.config == SIMPLE and version.output_name == "fontline-vi.pdf" and version.archived_at is not None
+    assert (directory / "versions" / version.id / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert (directory / "fontline-en.pdf").read_bytes().endswith(b"% rebuilt font=sans\n")
+    wait_gone(directory / "rebuild")
+    assert not (directory / "fontline-vi.pdf").exists()
+    assert version_dirs(directory) == [version.id]
+
+
+def test_an_archived_version_keeps_the_snapshot_of_the_translation_it_was(factory, settings, make_runner):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")  # lượt mới chạy cơ bản (retranslate_config NULL)
+    with factory() as db:
+        db.get(File, file_id).config = SIMPLE
+        db.commit()
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.config) == ("done", None)
+    assert versions_of(factory, file_id)[0].config == SIMPLE
+
+
+def test_version_numbers_keep_counting_and_the_oldest_versions_are_pruned_to_the_limit(factory, settings, make_runner):
+    set_max_versions(factory, 3)  # hiện tại + 2 bản cũ
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    runner = make_runner()
+    runner.start()
+    assert wait_row(factory, file_id).version_no == 2
+    for number in (3, 4, 5):
+        requeue_retranslate(factory, file_id, language="vi" if number % 2 else "en")
+        runner.enqueue(file_id)
+        assert wait_row(factory, file_id).version_no == number
+    versions = versions_of(factory, file_id)
+    assert [version.version_no for version in versions] == [3, 4]  # bản 1, 2 đã bị tỉa; nhãn "Bản 3"/"Bản 4" không đổi
+    wait_gone(directory / "rebuild")  # rmtree thư mục đã tỉa chạy sau commit
+    assert version_dirs(directory) == sorted(version.id for version in versions)
+    for version in versions:
+        assert (directory / "versions" / version.id / version.output_name).is_file()
+
+
+def test_lowering_max_versions_prunes_lazily_on_the_next_archive(factory, settings, make_runner):
+    set_max_versions(factory, 5)
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    runner = make_runner()
+    runner.start()
+    wait_row(factory, file_id)
+    for number in (3, 4, 5):
+        requeue_retranslate(factory, file_id, language="vi" if number % 2 else "en")
+        runner.enqueue(file_id)
+        wait_row(factory, file_id)
+    assert [version.version_no for version in versions_of(factory, file_id)] == [1, 2, 3, 4]
+    set_max_versions(factory, 2)
+    assert [version.version_no for version in versions_of(factory, file_id)] == [1, 2, 3, 4]  # hạ hạn không quét: chưa tỉa gì
+    wait_gone(directory / "rebuild")
+    assert len(version_dirs(directory)) == 4
+    requeue_retranslate(factory, file_id, language="en")
+    runner.enqueue(file_id)
+    assert wait_row(factory, file_id).version_no == 6
+    [kept] = versions_of(factory, file_id)
+    wait_gone(directory / "rebuild")
+    assert kept.version_no == 5 and version_dirs(directory) == [kept.id]
+
+
+def test_with_max_versions_one_nothing_is_archived_old_versions_are_pruned_and_the_number_still_grows(factory, settings, make_runner):
+    set_max_versions(factory, 3)
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    runner = make_runner()
+    runner.start()
+    wait_row(factory, file_id)
+    assert len(versions_of(factory, file_id)) == 1
+    set_max_versions(factory, 1)
+    requeue_retranslate(factory, file_id, language="vi")
+    runner.enqueue(file_id)
+    row = wait_row(factory, file_id)
+    assert (row.status, row.version_no, row.output_name) == ("done", 3, "fontline-vi.pdf")
+    wait_gone(directory / "rebuild")
+    assert versions_of(factory, file_id) == [] and version_dirs(directory) == []
+    assert not (directory / "fontline-en.pdf").exists()
+
+
+def test_a_font_rebuild_neither_archives_nor_bumps_the_version(factory, settings, make_runner):
+    file_id = add_translated(factory, settings, "fontline.pdf", rebuild_font="serif")
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.font, row.version_no) == ("done", "serif", 1) and versions_of(factory, file_id) == []
+
+
+def test_retranslating_a_failed_file_in_place_keeps_version_one(factory, settings, make_runner):
+    runner = make_runner()
+    runner.start()
+    file_id = add_file(factory, settings, "doc.pdf", engine="gemini", model="gemini-3.5-flash-lite")  # chưa có key → lỗi
+    runner.enqueue(file_id)
+    assert wait_row(factory, file_id).status == "error"
+    add_credential(factory, settings, "gemini")  # "Thêm key trong Cài đặt rồi bấm Dịch lại"
+    with factory() as db:  # như files.service._queue_retranslate nhánh error: tại chỗ, ghi thẳng lựa chọn + config mới
+        row = db.get(File, file_id)
+        row.status, row.language, row.config, row.message, row.rebuild_error = "queued", "en", SIMPLE, "", ""
+        row.output_name, row.started_at, row.finished_at = None, None, None
+        db.commit()
+    runner.enqueue(file_id)
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.language, row.config, row.version_no) == ("done", "doc-en.pdf", "en", SIMPLE, 1)
+    assert row.retranslate_language is None and row.rebuild_font is None  # không qua nhánh staged
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    assert (directory / "doc-en.pdf").is_file()
+    assert versions_of(factory, file_id) == [] and not (directory / "versions").exists()
+
+
+def test_a_failed_retranslate_leaves_the_version_store_alone(factory, settings, make_runner):
+    add_credential(factory, settings, "gemini")
+    file_id = add_retranslate(factory, settings, "newtable-rebuildfail.pdf", engine="gemini", model="gemini-3.5-flash-lite", font="sans")
+    with factory() as db:
+        db.get(File, file_id).retranslate_config = ACADEMIC
+        db.commit()
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.version_no, row.config, row.retranslate_config) == ("done", 1, None, None)
+    assert row.rebuild_error == "Dựng lại thất bại (worker giả)."
+    assert versions_of(factory, file_id) == [] and not (directory / "versions").exists()
+    assert (directory / "newtable-rebuildfail-vi.pdf").read_bytes() == PDF + b"old translation"
+
+
+@pytest.mark.parametrize("limits", [{"stall_seconds": 1}, {"stall_seconds": 30, "timeout_seconds": 1}], ids=["stall", "timeout"])
+def test_a_stalled_or_expired_retranslate_leaves_the_existing_versions_alone(factory, settings, make_runner, limits):
+    file_id = add_retranslate(factory, settings, "rebuildhang.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    kept = seed_version(factory, directory, file_id)
+    with factory() as db:
+        row = db.get(File, file_id)
+        row.config, row.retranslate_config = SIMPLE, ACADEMIC
+        db.commit()
+    make_runner(**limits).start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.language, row.version_no, row.config, row.retranslate_config) == ("done", "vi", 2, SIMPLE, None)
+    assert row.rebuild_error.startswith("Dừng vì" if "timeout_seconds" not in limits else "Quá")
+    assert [version.id for version in versions_of(factory, file_id)] == [kept] and version_dirs(directory) == [kept]
+    assert (directory / "versions" / kept / "archived-en.pdf").read_bytes() == b"archived v1"
+    assert (directory / "rebuildhang-vi.pdf").read_bytes() == PDF + b"old translation"
+
+
+def test_a_retranslate_without_a_usable_key_leaves_the_existing_versions_alone(factory, settings, make_runner):
+    file_id = add_retranslate(factory, settings, "doc.pdf", engine="gemini", model="gemini-3.5-flash-lite")  # không có credential
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    kept = seed_version(factory, directory, file_id)
+    with factory() as db:
+        row = db.get(File, file_id)
+        row.config, row.retranslate_config = SIMPLE, ACADEMIC
+        db.commit()
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.engine, row.version_no, row.config, row.retranslate_config) == ("done", "google_free", 2, SIMPLE, None)
+    assert row.rebuild_error == MISSING_KEY_MESSAGE.format(provider="Gemini (Google AI Studio)")
+    assert [version.id for version in versions_of(factory, file_id)] == [kept] and version_dirs(directory) == [kept]
+    assert (directory / "versions" / kept / "archived-en.pdf").read_bytes() == b"archived v1"
+    assert (directory / "doc-vi.pdf").read_bytes() == PDF + b"old translation"
+
+
+def test_a_database_failure_after_archiving_puts_the_old_translation_back_and_leaves_no_version(factory, settings, make_runner, monkeypatch):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    runner = make_runner()
+    fail_commit_swap(runner, monkeypatch)
+    runner.start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.language, row.version_no, row.retranslate_language) == ("done", "fontline-vi.pdf", "vi", 1, None)
+    assert row.rebuild_error == "Lỗi nội bộ (RuntimeError)."
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert not (directory / "fontline-en.pdf").exists() and not (directory / "rebuild").exists()
+    assert versions_of(factory, file_id) == [] and version_dirs(directory) == []
+
+
+def test_a_failed_archive_move_puts_the_old_translation_back_without_leaving_an_empty_version_folder(
+        factory, settings, make_runner, monkeypatch):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    fail_replace_once(monkeypatch, dst_name="fontline-vi.pdf", src_name=".previous")  # bước 3 (.previous → versions/<vid>/) hỏng
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.version_no, row.rebuild_error) == ("done", "fontline-vi.pdf", 1, "Lỗi nội bộ (OSError).")
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert not (directory / "fontline-en.pdf").exists()
+    assert versions_of(factory, file_id) == [] and version_dirs(directory) == []
+
+
+def fail_commit_inside_commit_swap(runner, monkeypatch) -> list:
+    """Giao dịch THẬT của _commit_swap (UPDATE + INSERT + tỉa đã chạy) hỏng đúng lúc commit. Trả danh sách version_no mà
+    giao dịch nhìn thấy ngay trước commit — chứng minh lỗi xảy ra SAU INSERT + tỉa, không phải trước."""
+    real_swap, real_sessions, seen = runner._commit_swap, runner._sessions, []
+
+    def failing_sessions():
+        db = real_sessions()
+
+        def commit():
+            seen.append(sorted(db.scalars(select(FileVersion.version_no)).all()))
+            raise RuntimeError("disk I/O error")
+
+        db.commit = commit
+        return db
+
+    def swap(*args, **kwargs):
+        runner._sessions = failing_sessions  # chỉ trong lời gọi này (một luồng chạy job)
+        try:
+            return real_swap(*args, **kwargs)
+        finally:
+            runner._sessions = real_sessions
+
+    monkeypatch.setattr(runner, "_commit_swap", swap)
+    return seen
+
+
+def test_a_failed_commit_after_insert_and_prune_rolls_back_the_whole_swap(factory, settings, make_runner, monkeypatch):
+    set_max_versions(factory, 2)  # giữ 1 bản cũ: lượt này chèn bản 3 và tỉa cả bản 1 lẫn 2 — trong giao dịch
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    first = seed_version(factory, directory, file_id, version_no=1, output_name="archived-1.pdf")
+    second = seed_version(factory, directory, file_id, version_no=2, output_name="archived-2.pdf")
+    with factory() as db:
+        row = db.get(File, file_id)
+        row.config, row.retranslate_config = SIMPLE, ACADEMIC
+        db.commit()
+    runner = make_runner()
+    seen = fail_commit_inside_commit_swap(runner, monkeypatch)
+    runner.start()
+    row = wait_row(factory, file_id)
+    assert seen == [[3]]  # trước commit: bản 3 đã chèn, bản 1 + 2 đã tỉa
+    assert (row.status, row.output_name, row.language, row.engine, row.version_no, row.config, row.retranslate_config) == (
+        "done", "fontline-vi.pdf", "vi", "google_free", 3, SIMPLE, None)
+    assert row.rebuild_error == "Lỗi nội bộ (RuntimeError)."
+    assert [(version.id, version.version_no) for version in versions_of(factory, file_id)] == [(first, 1), (second, 2)]
+    assert version_dirs(directory) == sorted([first, second])  # thư mục versions/<vid>/ của lượt hỏng đã gỡ, kho cũ nguyên
+    assert (directory / "versions" / first / "archived-1.pdf").read_bytes() == b"archived v1"
+    assert (directory / "versions" / second / "archived-2.pdf").read_bytes() == b"archived v1"
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert not (directory / "fontline-en.pdf").exists() and not (directory / "rebuild").exists()
+
+def test_a_database_failure_with_the_same_output_name_also_puts_the_old_translation_back(factory, settings, make_runner, monkeypatch):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="vi")  # tên mới == tên cũ
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    runner = make_runner()
+    fail_commit_swap(runner, monkeypatch)
+    runner.start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.version_no) == ("done", "fontline-vi.pdf", 1)
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"  # DB và đĩa cùng nói "bản cũ"
+    assert versions_of(factory, file_id) == [] and version_dirs(directory) == []
+
+
+def test_a_swap_whose_row_was_recovered_elsewhere_puts_the_archived_file_back(factory, settings, make_runner):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en", status="queued")  # runner khác đã phục hồi dòng
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    (directory / "rebuild").mkdir()
+    (directory / "rebuild" / "fontline-en.pdf").write_bytes(b"new render")
+    previous = Previous("fontline-vi.pdf", "vi", "google_free", None, "auto", "sans", 2, None, None, 1)
+    make_runner()._finish_rebuild(file_id, "u1", "serif", "fontline-vi.pdf", retranslate=("en", "google_free", "", None), message="Xong",
+                                  output_name="fontline-en.pdf", untranslated=0, font_used="serif", previous=previous, max_versions=3)
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"  # bản cũ về đúng chỗ, bản mới đã chép vào bị gỡ
+    assert not (directory / "fontline-en.pdf").exists()
+    assert versions_of(factory, file_id) == [] and version_dirs(directory) == []
+    with factory() as db:
+        row = db.get(File, file_id)
+        assert (row.status, row.version_no, row.retranslate_language) == ("queued", 1, "en")
+
+
+def test_staging_rescues_an_orphan_version_folder_holding_the_missing_current_output(factory, settings, make_runner):
+    file_id = add_translated(factory, settings, "fontline.pdf")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    orphan = directory / "versions" / "deadbeef0001"  # chết giữa bước 3 và 4: bản cũ đã sang kho, DB chưa commit → không có dòng
+    orphan.mkdir(parents=True)
+    (directory / "fontline-vi.pdf").replace(orphan / "fontline-vi.pdf")
+    make_runner()._staging(directory, "fontline-vi.pdf", known_versions=frozenset())
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert not orphan.exists()
+
+
+def test_staging_deletes_an_orphan_version_folder_when_the_current_output_is_present_and_keeps_known_ones(factory, settings, make_runner):
+    file_id = add_translated(factory, settings, "fontline.pdf")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    (directory / "versions" / "known0000001").mkdir(parents=True)
+    (directory / "versions" / "known0000001" / "fontline-en.pdf").write_bytes(b"v")
+    (directory / "versions" / "orphan000001").mkdir()
+    (directory / "versions" / "orphan000001" / "fontline-vi.pdf").write_bytes(b"pruned")  # tỉa đã commit, rmtree chưa kịp
+    make_runner()._staging(directory, "fontline-vi.pdf", known_versions=frozenset({"known0000001"}))
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"  # bản hiện tại không bị bản mồ côi đè
+    assert (directory / "versions" / "known0000001" / "fontline-en.pdf").is_file()
+    assert not (directory / "versions" / "orphan000001").exists()
+
+
+def test_recovery_after_a_crash_between_archive_and_commit_ends_with_exactly_one_version(factory, settings, make_runner):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en", status="running")
+    with factory() as db:
+        db.get(File, file_id).retranslate_config = ACADEMIC  # _recover giữ snapshot đang đỗ cùng retranslate_*
+        db.commit()
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    orphan = directory / "versions" / "deadbeef0001"
+    orphan.mkdir(parents=True)
+    (directory / "fontline-vi.pdf").replace(orphan / "fontline-vi.pdf")  # bản cũ chỉ còn trong thư mục mồ côi
+    (directory / "rebuild").mkdir()
+    (directory / "rebuild" / "fontline-en.pdf").write_bytes(b"ban moi do dang")
+    make_runner().start()  # _recover: running → queued, chạy lại lượt dịch lại; _staging cứu bản cũ về trước khi worker chạy
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.version_no, row.language) == ("done", "fontline-en.pdf", 2, "en")
+    assert (row.config, row.retranslate_config) == (ACADEMIC, None)
+    [version] = versions_of(factory, file_id)
+    assert version.config is None and version.output_name == "fontline-vi.pdf"
+    assert (directory / "versions" / version.id / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"
+    wait_gone(directory / "rebuild")
+    assert version_dirs(directory) == [version.id]  # thư mục mồ côi đã dọn, chỉ còn bản được ghi nhận
+    assert (directory / "fontline-en.pdf").read_bytes().endswith(b"% rebuilt font=serif\n")
+
+
+@pytest.mark.parametrize("failure", ["missing_key", "unknown_engine", "no_handoff_worker"])
+def test_a_rerun_that_fails_before_staging_still_rescues_the_old_translation_from_an_orphan_version(
+        factory, settings, make_runner, failure):
+    """Chết giữa bước 3 và 4 (bản cũ chỉ còn trong versions/<x>/ mồ côi), rồi lượt chạy lại hỏng TRƯỚC _staging: bản cũ vẫn phải
+    về thư mục job — không thì tệp trở lại `done` mà tải xuống trả 410."""
+    if failure == "no_handoff_worker":
+        add_credential(factory, settings, "gemini")
+    engine = "nope" if failure == "unknown_engine" else "gemini"
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en", engine=engine, model="gemini-3.5-flash-lite",
+                              status="running")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    orphan = directory / "versions" / "deadbeef0001"
+    orphan.mkdir(parents=True)
+    (directory / "fontline-vi.pdf").replace(orphan / "fontline-vi.pdf")
+    make_runner(**({"handoff_worker_cmd": ()} if failure == "no_handoff_worker" else {})).start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.language, row.version_no, row.retranslate_language) == ("done", "fontline-vi.pdf", "vi", 1, None)
+    assert row.rebuild_error == {
+        "missing_key": MISSING_KEY_MESSAGE.format(provider="Gemini (Google AI Studio)"),
+        "unknown_engine": "Engine dịch không được hỗ trợ: nope",
+        "no_handoff_worker": NO_HANDOFF_WORKER_MESSAGE,
+    }[failure]
+    path, _ = download_target(settings, row, "translated")  # đúng đường tải xuống: không 410
+    assert path == directory / "fontline-vi.pdf" and path.read_bytes() == PDF + b"old translation"
+    assert versions_of(factory, file_id) == [] and version_dirs(directory) == []
+
+
+def test_a_stranded_backup_wins_over_a_stale_orphan_with_the_same_name_when_the_rerun_fails_early(factory, settings, make_runner):
+    """Hai sự cố chồng nhau: chết giữa bước 1 và 2 (bản hiện tại chỉ còn ở rebuild/.previous) VÀ một thư mục kho mồ côi cũ
+    (tỉa xong chưa kịp xoá) mang cùng tên; lượt chạy lại hỏng sớm (thiếu key). .previous là bản thật — phải thắng."""
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en", engine="gemini", model="gemini-3.5-flash-lite",
+                              status="running")  # không có credential
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    (directory / "rebuild").mkdir()
+    (directory / "fontline-vi.pdf").replace(directory / "rebuild" / ".previous")
+    (directory / "versions" / "orphan000001").mkdir(parents=True)
+    (directory / "versions" / "orphan000001" / "fontline-vi.pdf").write_bytes(b"stale pruned version")
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.version_no) == ("done", "fontline-vi.pdf", 1)
+    assert row.rebuild_error == MISSING_KEY_MESSAGE.format(provider="Gemini (Google AI Studio)")
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert version_dirs(directory) == [] and not (directory / "rebuild").exists()
+
+
+# ---- Giờ của bản dịch (spec 2026-10-15 §4) ---------------------------------------------------------------------
+
+
+def stamp(factory, file_id, **values) -> None:
+    """Đặt vài cột của dòng files thẳng DB (trạng thái "đã có từ trước" của một tệp)."""
+    with factory() as db:
+        row = db.get(File, file_id)
+        for name, value in values.items():
+            setattr(row, name, value)
+        db.commit()
+
+
+def test_translated_at_is_set_when_a_translation_finishes(factory, settings, make_runner):
+    row = run_one(factory, settings, make_runner, "doc.pdf")
+    assert row.status == "done" and row.translated_at is not None and row.translated_at == row.finished_at
+
+
+def test_a_font_rebuild_keeps_translated_at_while_a_retranslate_moves_it(factory, settings, make_runner):
+    file_id = add_translated(factory, settings, "fontline.pdf", rebuild_font="serif")
+    before = utcnow() - timedelta(days=1)
+    stamp(factory, file_id, translated_at=before)
+    runner = make_runner()
+    runner.start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.font, row.translated_at) == ("done", "serif", before)  # dựng lại font: cùng bản dịch, giờ dịch không đổi
+    assert row.finished_at is not None and row.finished_at > before
+    requeue_retranslate(factory, file_id, language="en")
+    runner.enqueue(file_id)
+    row = wait_row(factory, file_id)
+    assert (row.status, row.version_no) == ("done", 2) and row.translated_at == row.finished_at and row.translated_at > before
+    [version] = versions_of(factory, file_id)
+    assert version.translated_at == before and version.restored_from is None  # bản cũ mang giờ dịch của chính nó
+
+
+def test_an_archived_version_keeps_restored_from_and_a_fresh_retranslate_clears_it(factory, settings, make_runner):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    stamp(factory, file_id, restored_from=1, translated_at=utcnow() - timedelta(hours=1))
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.version_no, row.restored_from) == ("done", 2, None)  # bản dịch mới không "khôi phục từ" gì
+    [version] = versions_of(factory, file_id)
+    assert version.restored_from == 1 and version.translated_at is not None
+
+
+# ---- Bảng đoạn đi theo phiên bản (spec 2026-10-15 §3) ----------------------------------------------------------
+
+
+def test_a_retranslate_copies_the_old_segment_table_into_the_version_store_and_the_new_one_into_the_job(factory, settings, make_runner):
+    add_credential(factory, settings, "gemini")
+    file_id = add_retranslate(factory, settings, "newtable.pdf", language="en", engine="gemini", model="gemini-3.8-flash", font="sans")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.version_no) == ("done", 2)
+    [version] = versions_of(factory, file_id)
+    store = directory / "versions" / version.id
+    assert (store / "segments.jsonl").read_text(encoding="utf-8") == "old\n"  # BẢN SAO của bảng cũ đi theo bản cũ
+    assert (store / "segments.meta.json").read_text(encoding="utf-8") == "meta\n"
+    assert (store / "newtable-vi.pdf").is_file()
+    wait_gone(directory / "rebuild")  # thay bảng chạy SAU commit
+    assert (directory / "segments.jsonl").read_text(encoding="utf-8") == '{"src": "x", "dst": "y"}\n'  # bảng mới ở thư mục job
+    assert (directory / "newtable-en.pdf").is_file()
+
+
+def test_a_version_of_a_plain_engine_file_has_no_table_to_carry(factory, settings, make_runner):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    for name in ("segments.jsonl", "segments.meta.json"):
+        (directory / name).unlink()  # tệp Google miễn phí thật không có bảng đoạn (add_retranslate gieo bảng giả — bỏ đi)
+    make_runner().start()
+    assert wait_row(factory, file_id).status == "done"
+    [version] = versions_of(factory, file_id)
+    assert not (directory / "versions" / version.id / "segments.jsonl").exists()
+    wait_gone(directory / "rebuild")
+    assert not (directory / "segments.jsonl").exists()
+
+
+def test_a_database_failure_after_archiving_removes_the_copied_tables_with_the_version_folder(factory, settings, make_runner, monkeypatch):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    runner = make_runner()
+    fail_commit_swap(runner, monkeypatch)
+    runner.start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.version_no, row.rebuild_error) == ("done", 1, "Lỗi nội bộ (RuntimeError).")
+    assert versions_of(factory, file_id) == [] and version_dirs(directory) == []  # _put_back rmtree cả thư mục kho (kèm bản sao bảng)
+    assert (directory / "segments.jsonl").read_text(encoding="utf-8") == "old\n"  # bảng job (bản gốc) nguyên
+    assert (directory / "segments.meta.json").read_text(encoding="utf-8") == "meta\n"
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"
+
+
+def fail_table_copy_into_the_store(monkeypatch):
+    """shutil.copyfile lỗi (hết đĩa) đúng khi đích nằm trong versions/<vid>/ — bước chép bảng của _finish_rebuild."""
+    from app.engine import jobs
+    real = jobs.shutil.copyfile
+
+    def copyfile(src, dst, *args, **kwargs):
+        if Path(dst).parent.parent.name == "versions":
+            raise OSError(28, "No space left on device")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(jobs.shutil, "copyfile", copyfile)
+
+
+def test_a_failed_table_copy_puts_the_old_translation_back_like_a_database_failure(factory, settings, make_runner, monkeypatch):
+    file_id = add_retranslate(factory, settings, "fontline.pdf", language="en")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    fail_table_copy_into_the_store(monkeypatch)
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.version_no, row.rebuild_error) == ("done", "fontline-vi.pdf", 1, "Lỗi nội bộ (OSError).")
+    assert (directory / "fontline-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert not (directory / "fontline-en.pdf").exists() and not (directory / "rebuild").exists()
+    assert versions_of(factory, file_id) == [] and version_dirs(directory) == []
+    assert (directory / "segments.jsonl").read_text(encoding="utf-8") == "old\n"
+
+
+# ---- Khôi phục bản cũ (spec 2026-10-15 §2) -----------------------------------------------------------------------
+
+
+def add_restore(factory, settings, filename="doc.pdf", *, status="queued", with_tables=True, src_engine="gemini",
+                src_model="gemini-3.5-flash-lite", src_config=ACADEMIC) -> tuple[str, str]:
+    """Tệp đã xong (Bản 2 = bản hiện tại: PDF "old translation", bảng "old"/"meta", google_free, snapshot SIMPLE) có Bản 1 trong kho
+    (PDF "archived v1", tiếng Anh, `src_engine`/`src_model`, snapshot `src_config`, font serif, 7 đoạn chưa dịch, bảng "v1" + meta THẬT
+    của lựa chọn đó khi `with_tables`) vừa được yêu cầu khôi phục Bản 1 — đúng UPDATE của files.service.restore_version. Trả (file_id, version_id)."""
+    file_id = add_translated(factory, settings, filename, rebuild_font="serif", status="done")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    seed_tables(directory)
+    version_id = seed_version(factory, directory, file_id, version_no=1, output_name=f"{Path(filename).stem}-en.pdf")
+    if with_tables:
+        (directory / "versions" / version_id / "segments.jsonl").write_text('{"src": "v1", "dst": "V1"}\n', encoding="utf-8")
+        meta = handoff_meta(ENGINE_BY_ID[src_engine].provider, src_model, "en", src_config)  # như handoff_worker.run đã ghi cho Bản 1
+        (directory / "versions" / version_id / "segments.meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    with factory() as db:
+        version = db.get(FileVersion, version_id)
+        version.engine, version.model, version.config, version.font, version.font_used, version.untranslated = (
+            src_engine, src_model, src_config, "serif", "serif", 7)
+        version.translated_at = utcnow() - timedelta(days=2)
+        row = db.get(File, file_id)
+        row.config, row.translated_at = SIMPLE, utcnow() - timedelta(days=1)
+        row.restore_version, row.rebuild_font = version_id, "serif"
+        row.retranslate_language, row.retranslate_engine, row.retranslate_model, row.retranslate_config = "en", src_engine, src_model, src_config
+        row.status, row.done_pages, row.total_pages, row.message, row.stage = status, 0, 0, "", ""
+        db.commit()
+    return file_id, version_id
+
+
+def handoff_meta(provider: str, model: str | None, language: str, config: str | None) -> dict:
+    """segments.meta.json đúng như handoff_worker.run ghi cho lựa chọn này: chỉ dẫn là chuỗi runner dựng từ snapshot (jobs.py), lưu sha256."""
+    return {"provider": provider, "model": model, "target_language": language,
+            "instructions": instructions_digest(build_instructions(load_snapshot(config), language))}
+
+
+def record_replaces(monkeypatch) -> list[tuple[Path, Path]]:
+    """Ghi lại mọi os.replace (nguồn, đích) — chứng minh một bước đổi tên THẬT SỰ đã chạy, không chỉ là kết quả trông giống."""
+    from app.engine import jobs
+    real, calls = jobs.os.replace, []
+
+    def replace(src, dst, *args, **kwargs):
+        calls.append((Path(src), Path(dst)))
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(jobs.os, "replace", replace)
+    return calls
+
+
+def test_restoring_a_version_copies_it_into_place_without_a_worker_or_a_key_and_archives_the_current_one(
+        factory, settings, make_runner, monkeypatch):
+    file_id, version_id = add_restore(factory, settings, "doc.pdf")  # bản nguồn Gemini, KHÔNG có credential nào
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    replaces = record_replaces(monkeypatch)
+    runner = make_runner()
+    ran = processed_by(runner)
+    runner.start()
+    row = wait_row(factory, file_id)
+    assert ran == [] and not (directory / "env-seen.json").exists()  # không worker nào chạy, không cần key
+    assert (row.status, row.message, row.output_name, row.language, row.engine, row.model) == (
+        "done", "Xong", "doc-en.pdf", "en", "gemini", "gemini-3.5-flash-lite")
+    assert (row.font, row.font_used, row.untranslated, row.config, row.version_no, row.restored_from) == ("serif", "serif", 7, ACADEMIC, 3, 1)
+    assert (row.restore_version, row.retranslate_language, row.retranslate_engine, row.retranslate_model, row.retranslate_config,
+            row.rebuild_font, row.rebuild_error) == (None, None, None, None, None, None, "")
+    assert row.translated_at == row.finished_at
+    assert (directory / "doc-en.pdf").read_bytes() == b"archived v1"
+    # Bản sao vào rebuild/ qua .tmp rồi MỘT phép đổi tên: chết giữa lúc chép không để lại tệp cụt mang tên kết quả.
+    assert (directory / "rebuild" / "doc-en.pdf.tmp", directory / "rebuild" / "doc-en.pdf") in replaces
+    source, archived = versions_of(factory, file_id)
+    assert source.id == version_id and (directory / "versions" / version_id / "doc-en.pdf").read_bytes() == b"archived v1"  # nguồn nguyên
+    assert (archived.version_no, archived.language, archived.engine, archived.config, archived.output_name, archived.restored_from) == (
+        2, "vi", "google_free", SIMPLE, "doc-vi.pdf", None)
+    assert archived.translated_at is not None and archived.translated_at < row.translated_at
+    assert (directory / "versions" / archived.id / "doc-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert (directory / "versions" / archived.id / "segments.jsonl").read_text(encoding="utf-8") == "old\n"  # bảng cũ đi theo bản bị thay
+    wait_gone(directory / "rebuild")
+    assert (directory / "segments.jsonl").read_text(encoding="utf-8") == '{"src": "v1", "dst": "V1"}\n'  # bảng của nguồn ở thư mục job
+    assert (directory / "segments.meta.json").read_text(encoding="utf-8") == (
+        directory / "versions" / version_id / "segments.meta.json").read_text(encoding="utf-8")
+    assert (directory / "versions" / version_id / "segments.jsonl").is_file()  # CHÉP bảng nguồn, không chuyển
+    assert not (directory / "doc-vi.pdf").exists()
+
+
+def test_restoring_a_version_without_a_table_drops_the_job_table(factory, settings, make_runner):
+    file_id, _version_id = add_restore(factory, settings, "doc.pdf", with_tables=False, src_engine="google_free", src_model=None, src_config=None)
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.engine, row.config, row.version_no) == ("done", "google_free", None, 3)
+    wait_gone(directory / "rebuild")
+    assert not (directory / "segments.jsonl").exists() and not (directory / "segments.meta.json").exists()
+    _source, archived = versions_of(factory, file_id)
+    assert (directory / "versions" / archived.id / "segments.jsonl").read_text(encoding="utf-8") == "old\n"
+
+
+def test_a_font_rebuild_right_after_a_restore_reuses_the_restored_table_without_calling_the_api(factory, settings, make_runner):
+    add_credential(factory, settings, "gemini")
+    file_id, _version_id = add_restore(factory, settings, "doc.pdf")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    runner = make_runner()
+    runner.start()
+    assert wait_row(factory, file_id).version_no == 3
+    wait_gone(directory / "rebuild")
+    with factory() as db:  # như files.service.rebuild_file
+        row = db.get(File, file_id)
+        row.status, row.rebuild_font, row.rebuild_error, row.message = "queued", "sans", "", ""
+        db.commit()
+    restored_meta = json.loads((directory / "segments.meta.json").read_text(encoding="utf-8"))  # meta của bảng bản nguồn, đã chép về
+    assert restored_meta == handoff_meta("gemini", "gemini-3.5-flash-lite", "en", ACADEMIC)
+    runner.enqueue(file_id)
+    row = wait_row(factory, file_id)
+    assert (row.status, row.font, row.version_no, row.config) == ("done", "sans", 3, ACADEMIC)
+    seen = env_seen(settings, file_id)
+    assert seen["table_seen"] is True and seen["provider"] == "gemini" and HEADER in seen["instructions"]  # bảng + chỉ dẫn của bản khôi phục
+    # Lựa chọn worker nhận cho lượt dựng lại == meta của bảng → _resume thật dùng lại cả bảng, không đoạn nào phải gọi nhà cung cấp.
+    worker_meta = {"provider": seen["provider"], "model": seen["model"], "target_language": seen["argv"][2],
+                   "instructions": instructions_digest(seen["instructions"])}
+    assert worker_meta == restored_meta
+    assert seen["meta_matches"] is True  # cùng phép so của _resume, trên meta thật nằm trong rebuild/
+
+
+@pytest.mark.parametrize("missing", ["file", "row"])
+def test_restoring_when_the_source_is_gone_aborts_and_keeps_the_current_translation(factory, settings, make_runner, missing):
+    file_id, version_id = add_restore(factory, settings, "doc.pdf")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    if missing == "file":
+        (directory / "versions" / version_id / "doc-en.pdf").unlink()
+    else:
+        with factory() as db:
+            db.execute(delete(FileVersion).where(FileVersion.id == version_id))
+            db.commit()
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.language, row.version_no, row.restored_from) == ("done", "doc-vi.pdf", "vi", 2, None)
+    assert row.rebuild_error == RESTORE_SOURCE_MISSING_MESSAGE
+    assert (row.restore_version, row.retranslate_language, row.rebuild_font, row.config) == (None, None, None, SIMPLE)
+    assert (directory / "doc-vi.pdf").read_bytes() == PDF + b"old translation" and not (directory / "rebuild").exists()
+    assert (directory / "segments.jsonl").read_text(encoding="utf-8") == "old\n"
+    assert [version.id for version in versions_of(factory, file_id)] == ([version_id] if missing == "file" else [])
+    assert version_dirs(directory) == ([version_id] if missing == "file" else [])  # dòng mất → thư mục thành mồ côi, bị dọn
+
+
+def test_a_failed_rename_of_the_copied_source_aborts_the_restore_without_leaving_a_partial_file(factory, settings, make_runner, monkeypatch):
+    file_id, version_id = add_restore(factory, settings, "doc.pdf")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    fail_replace_once(monkeypatch, dst_name="doc-en.pdf", src_name="doc-en.pdf.tmp")  # đã chép xong .tmp, đổi tên hỏng (hết đĩa)
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.language, row.version_no, row.restored_from, row.config) == (
+        "done", "doc-vi.pdf", "vi", 2, None, SIMPLE)
+    assert (row.rebuild_error, row.restore_version, row.retranslate_language, row.rebuild_font) == ("Lỗi nội bộ (OSError).", None, None, None)
+    assert (directory / "doc-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert not (directory / "doc-en.pdf").exists() and not (directory / "rebuild").exists()  # .tmp đi theo rebuild/
+    assert (directory / "segments.jsonl").read_text(encoding="utf-8") == "old\n"
+    assert [version.id for version in versions_of(factory, file_id)] == [version_id] and version_dirs(directory) == [version_id]
+    assert (directory / "versions" / version_id / "doc-en.pdf").read_bytes() == b"archived v1"
+
+
+def test_restoring_the_oldest_version_at_the_limit_prunes_the_source_only_after_the_copy_is_in_place(factory, settings, make_runner):
+    set_max_versions(factory, 2)  # hiện tại + 1 bản cũ
+    file_id, version_id = add_restore(factory, settings, "doc.pdf")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.version_no, row.restored_from) == ("done", 3, 1)
+    assert (directory / "doc-en.pdf").read_bytes() == b"archived v1"  # bản sao đã là bản hiện tại
+    [archived] = versions_of(factory, file_id)
+    assert archived.version_no == 2  # Bản 1 (nguồn) là bản cũ nhất vượt hạn → bị tỉa trong cùng giao dịch
+    wait_gone(directory / "rebuild")
+    assert version_dirs(directory) == [archived.id] and version_id not in version_dirs(directory)
+
+
+def test_stale_segment_tables_left_in_rebuild_are_dropped_before_a_restore_copies_the_source(factory, settings, make_runner):
+    file_id, _version_id = add_restore(factory, settings, "doc.pdf", with_tables=False)
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    (directory / "rebuild").mkdir()
+    for name in ("segments.jsonl", "segments.meta.json"):
+        (directory / "rebuild" / name).write_text("stale\n", encoding="utf-8")  # một lượt dịch lại bị ngắt để lại; _staging cố ý giữ
+    make_runner().start()
+    assert wait_row(factory, file_id).version_no == 3
+    wait_gone(directory / "rebuild")
+    assert not (directory / "segments.jsonl").exists()  # không phải bảng của bản nguồn → không được theo vào thư mục job
+
+
+def test_a_database_failure_during_a_restore_puts_the_current_translation_back(factory, settings, make_runner, monkeypatch):
+    file_id, version_id = add_restore(factory, settings, "doc.pdf")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    runner = make_runner()
+    fail_commit_swap(runner, monkeypatch)
+    runner.start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.language, row.version_no, row.restored_from, row.config) == (
+        "done", "doc-vi.pdf", "vi", 2, None, SIMPLE)
+    assert row.rebuild_error == "Lỗi nội bộ (RuntimeError)." and row.restore_version is None
+    assert (directory / "doc-vi.pdf").read_bytes() == PDF + b"old translation" and not (directory / "doc-en.pdf").exists()
+    assert not (directory / "rebuild").exists() and (directory / "segments.jsonl").read_text(encoding="utf-8") == "old\n"
+    assert [version.id for version in versions_of(factory, file_id)] == [version_id] and version_dirs(directory) == [version_id]
+
+
+def test_a_failed_commit_during_a_restore_rolls_back_the_whole_swap(factory, settings, make_runner, monkeypatch):
+    set_max_versions(factory, 2)
+    file_id, version_id = add_restore(factory, settings, "doc.pdf")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    runner = make_runner()
+    seen = fail_commit_inside_commit_swap(runner, monkeypatch)
+    runner.start()
+    row = wait_row(factory, file_id)
+    assert seen == [[2]]  # trước commit: Bản 2 đã chèn, Bản 1 (nguồn, vượt hạn) đã tỉa — rồi commit hỏng
+    assert (row.status, row.output_name, row.version_no, row.restored_from) == ("done", "doc-vi.pdf", 2, None)
+    assert [version.id for version in versions_of(factory, file_id)] == [version_id]  # rollback: nguồn còn, Bản 2 không có
+    assert version_dirs(directory) == [version_id] and (directory / "versions" / version_id / "doc-en.pdf").read_bytes() == b"archived v1"
+    assert (directory / "doc-vi.pdf").read_bytes() == PDF + b"old translation" and not (directory / "doc-en.pdf").exists()
+
+
+def test_recovery_reruns_an_interrupted_restore_and_ends_with_the_source_intact_and_one_new_version(factory, settings, make_runner):
+    file_id, version_id = add_restore(factory, settings, "doc.pdf", status="running")  # chết giữa bước 3 và 4 của lượt khôi phục
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    orphan = directory / "versions" / "deadbeef0001"
+    orphan.mkdir(parents=True)
+    (directory / "doc-vi.pdf").replace(orphan / "doc-vi.pdf")  # bản hiện tại chỉ còn trong thư mục mồ côi
+    (directory / "rebuild").mkdir()
+    (directory / "rebuild" / "doc-en.pdf.tmp").write_bytes(b"chep do dang")
+    make_runner().start()  # _recover: running → queued (giữ restore_version + retranslate_*), chạy lại từ đầu
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.version_no, row.restored_from) == ("done", "doc-en.pdf", 3, 1)
+    assert (directory / "doc-en.pdf").read_bytes() == b"archived v1"
+    source, archived = versions_of(factory, file_id)
+    assert source.id == version_id and archived.output_name == "doc-vi.pdf"
+    assert (directory / "versions" / archived.id / "doc-vi.pdf").read_bytes() == PDF + b"old translation"
+    wait_gone(directory / "rebuild")
+    assert version_dirs(directory) == sorted([version_id, archived.id])  # thư mục mồ côi đã dọn, tệp .tmp không còn
+
+
+def test_a_restore_rerun_that_finds_the_source_missing_still_rescues_the_current_translation_from_an_orphan(factory, settings, make_runner):
+    file_id, version_id = add_restore(factory, settings, "doc.pdf", status="running")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    orphan = directory / "versions" / "deadbeef0001"
+    orphan.mkdir(parents=True)
+    (directory / "doc-vi.pdf").replace(orphan / "doc-vi.pdf")
+    (directory / "versions" / version_id / "doc-en.pdf").unlink()  # tệp nguồn mất đúng lúc này
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.output_name, row.version_no, row.rebuild_error) == ("done", "doc-vi.pdf", 2, RESTORE_SOURCE_MISSING_MESSAGE)
+    path, _ = download_target(settings, row, "translated")  # đúng đường tải xuống: không 410
+    assert path == directory / "doc-vi.pdf" and path.read_bytes() == PDF + b"old translation"
+    assert [version.id for version in versions_of(factory, file_id)] == [version_id] and version_dirs(directory) == [version_id]
+
+
+def test_a_font_rebuild_after_a_restore_that_died_past_its_commit_cleans_up_and_keeps_both_versions(factory, settings, make_runner):
+    """Chết giữa bước 4 và 6 của lượt khôi phục (spec 2026-10-15 §2 (c)–(d)): giao dịch đã commit — Bản 3 là bản sao của Bản 1,
+    Bản 2 vào kho, một bản vượt hạn đã mất dòng — nhưng thư mục của bản đã tỉa chưa xoá và rebuild/ còn bảng của bản nguồn (bảng
+    thư mục job chưa thay: §2 (d), không kiểm ở đây). Lượt dựng lại font kế tiếp: _staging dọn thư mục mồ côi, kho có dòng nguyên."""
+    add_credential(factory, settings, "gemini")
+    file_id, source_id = add_restore(factory, settings, "doc.pdf")
+    directory = file_dir(settings.users_dir, "u1", file_id)
+    store = directory / "versions"
+    archived_id = "archived0002"
+    (store / archived_id).mkdir()
+    (directory / "doc-vi.pdf").replace(store / archived_id / "doc-vi.pdf")  # bước 3: bản hiện tại cũ (+ bảng của nó) vào kho
+    for name in ("segments.jsonl", "segments.meta.json"):
+        (store / archived_id / name).write_bytes((directory / name).read_bytes())
+    (directory / "doc-en.pdf").write_bytes((store / source_id / "doc-en.pdf").read_bytes())  # bước 2: bản sao đã vào chỗ
+    (directory / "rebuild").mkdir()
+    for name in ("segments.jsonl", "segments.meta.json"):
+        (directory / "rebuild" / name).write_bytes((store / source_id / name).read_bytes())  # chờ _replace_tables sau commit
+    (store / "orphan000001").mkdir()
+    (store / "orphan000001" / "doc-old.pdf").write_bytes(b"pruned")  # dòng đã tỉa trong giao dịch, rmtree chưa kịp
+    with factory() as db:
+        db.add(FileVersion(id=archived_id, file_id=file_id, version_no=2, language="vi", engine="google_free", font="auto",
+                           font_used="sans", config=SIMPLE, output_name="doc-vi.pdf", untranslated=2, archived_at=utcnow()))
+        row = db.get(File, file_id)  # giá trị mà giao dịch của lượt khôi phục đã ghi, rồi người dùng bấm dựng lại font
+        row.output_name, row.language, row.engine, row.model, row.font, row.font_used, row.untranslated, row.config = (
+            "doc-en.pdf", "en", "gemini", "gemini-3.5-flash-lite", "serif", "serif", 7, ACADEMIC)
+        row.version_no, row.restored_from, row.restore_version, row.rebuild_font = 3, 1, None, "sans"
+        row.retranslate_language = row.retranslate_engine = row.retranslate_model = row.retranslate_config = None
+        db.commit()
+    make_runner().start()
+    row = wait_row(factory, file_id)
+    assert (row.status, row.rebuild_error, row.output_name, row.font, row.version_no, row.restored_from) == (
+        "done", "", "doc-en.pdf", "sans", 3, 1)  # dựng lại font: cùng bản dịch, vẫn "khôi phục từ Bản 1"
+    assert not (store / "orphan000001").exists()
+    assert [(version.id, version.version_no) for version in versions_of(factory, file_id)] == [(source_id, 1), (archived_id, 2)]
+    assert version_dirs(directory) == sorted([source_id, archived_id])
+    assert (store / source_id / "doc-en.pdf").read_bytes() == b"archived v1"
+    assert (store / archived_id / "doc-vi.pdf").read_bytes() == PDF + b"old translation"
+    assert (store / archived_id / "segments.jsonl").read_text(encoding="utf-8") == "old\n"
+    wait_gone(directory / "rebuild")
+    assert (directory / "doc-en.pdf").read_bytes().endswith(b"% rebuilt font=sans\n")
+
+
+def test_recovery_keeps_the_restore_request(factory, settings, make_runner):
+    file_id, version_id = add_restore(factory, settings, "doc.pdf", status="running")
+    make_runner()._recover()
+    with factory() as db:
+        row = db.get(File, file_id)
+        assert (row.status, row.restore_version, row.retranslate_language, row.rebuild_font) == ("queued", version_id, "en", "serif")

@@ -13,6 +13,7 @@ import { fontOptions } from '../files/fonts';
 import { pdfError } from '../files/validatePdf';
 import { useMeta } from '../files/useMeta';
 import { errorText, t } from '../i18n/t';
+import { AdvancedFields, initialAdvanced, toAdvancedChoice, type AdvancedState } from './AdvancedFields';
 import { EngineChoiceFields } from './EngineChoiceFields';
 
 type Props = {
@@ -62,6 +63,7 @@ export function UploadModal({ isOpen, onClose, onUploaded, initialFile }: Props)
   const [choice, setChoice] = useState<EngineChoice | null>(null);
   // null khi chưa có / không tải được cài đặt → không gửi `font` (server dùng mặc định, vô hại vì không trả phí).
   const [font, setFont] = useState<string | null>(null);
+  const [advanced, setAdvanced] = useState<AdvancedState | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [language, setLanguage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -80,6 +82,7 @@ export function UploadModal({ isOpen, onClose, onUploaded, initialFile }: Props)
       setSettingsState('loading');
       setChoice(null);
       setFont(null);
+      setAdvanced(null);
       return;
     }
     // Không cache: người dùng có thể vừa thêm/xoá key ở Cài đặt. Lỗi → ẩn nhóm chế độ và gửi RÕ engine
@@ -92,6 +95,7 @@ export function UploadModal({ isOpen, onClose, onUploaded, initialFile }: Props)
         setSettings(loaded);
         setChoice(initialChoice(loaded));
         setFont(loaded.default_font);
+        setAdvanced(loaded.advance_mode ? initialAdvanced(loaded) : null); // tải lên: chọn sẵn hồ sơ mặc định
         setSettingsState('ready');
       })
       .catch(() => { if (alive) setSettingsState('failed'); });
@@ -125,7 +129,9 @@ export function UploadModal({ isOpen, onClose, onUploaded, initialFile }: Props)
     const picked = choice ? chosenEngine(choice) : { engine: 'google_free', model: null };
     try {
       // Thành công thì giữ busy: trang cha chuyển sang màn tệp, nút không được bấm lại.
-      onUploaded(await filesApi.upload(file, chosenLanguage, picked.engine, picked.model, font ?? undefined));
+      // Trường nâng cao chỉ đi cùng động cơ AI (server từ chối trường hợp khác): đổi sang Dịch thuần là bỏ hết.
+      const extra = settings && advanced && picked.engine === 'gemini' ? toAdvancedChoice(advanced, settings) : null;
+      onUploaded(await filesApi.upload(file, chosenLanguage, picked.engine, picked.model, font ?? undefined, extra));
     } catch (caught) {
       const apiError = toApiError(caught);
       setError(errorText(apiError.code, apiError.params));
@@ -194,6 +200,11 @@ export function UploadModal({ isOpen, onClose, onUploaded, initialFile }: Props)
             <Select key={settings.default_font} id="upload-font" defaultValue={settings.default_font}
               options={fontOptions()} onChange={(event) => setFont(event.target.value)} />
           </FormGroup>
+        )}
+        {/* Mục Nâng cao chỉ với động cơ AI (spec 2026-10-15 §6): dịch thuần không có hồ sơ/ngữ cảnh — không hiện gì, không câu nhắc. */}
+        {settings && advanced && choice && choice.mode === 'ai' && (
+          <AdvancedFields idPrefix="upload" settings={settings} value={advanced} onChange={setAdvanced}
+            onProfilesChange={(profiles) => setSettings((current) => (current ? { ...current, profiles } : current))} />
         )}
         {error && <Alert type="error" placement="inline">{error}</Alert>}
       </FlexBox>

@@ -18,6 +18,7 @@ from .engine.jobs import JobRunner
 from .errors import ApiError, api_error_handler, http_exception_handler, validation_error_handler
 from .files.router import router as files_router
 from .limits import BodyLimitMiddleware
+from .profiles.router import router as profiles_router
 from .providers.client import RequestsTransport
 from .providers.router import router as settings_router
 from .spa import mount_spa
@@ -66,6 +67,7 @@ def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -
     app.include_router(account_router)
     app.include_router(files_router)
     app.include_router(settings_router)
+    app.include_router(profiles_router)
     app.include_router(system_router)
     app.include_router(setup_router)
     if settings.static_dir is not None:

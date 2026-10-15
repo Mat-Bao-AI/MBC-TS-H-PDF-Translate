@@ -5,12 +5,12 @@ from dataclasses import replace
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import delete, event, select, update
+from sqlalchemy import delete, event, func, select, update
 
 from app.db import utcnow
 from app.engine.paths import file_dir
 from app.files import service
-from app.models import File, User
+from app.models import File, FileVersion, User
 from app.system.store import instance_row
 from helpers import PDF, save_key, upload, wait_file
 
@@ -206,6 +206,453 @@ def test_retranslate_takes_a_pending_slot_with_the_effective_limit(client, me):
     assert response.status_code == 429 and response.json() == {"detail": {"code": "too_many_pending", "limit": 1}}
     assert client.get(f"/api/files/{file_id}").json()["status"] == "done"
     wait_file(client, blocker)
+
+
+# ---- Chế độ nâng cao: snapshot (spec 2026-10-14 §3, §7) --------------------------------------------------------
+
+
+def enable_advanced(client, default_profile=None):
+    """Bật Chế độ nâng cao như UI thật: động cơ mặc định là AI (spec 2026-10-15 §6 — động cơ thuần làm server tắt chế độ). Mọi test
+    gọi hàm này đều đã save_key(client, "gemini") trước."""
+    body = {"default_engine": "gemini", "default_model": "gemini-3.5-flash-lite", "advance_mode": True, "default_profile": default_profile}
+    response = client.put("/api/settings/preferences", json=body)
+    assert response.status_code == 200 and response.json()["advance_mode"] is True, response.text
+
+
+def upload_advanced(client, name="doc.pdf", *, engine="gemini", model=None, profile=None, style=None, context=None, language="vi"):
+    form = {"language": language, "engine": engine}
+    if model:
+        form["model"] = model
+    if profile is not None:
+        form["profile"] = profile
+    if style is not None:
+        form["style"] = style if isinstance(style, str) else json.dumps(style)
+    if context is not None:
+        form["context"] = context
+    return client.post("/api/files", files={"file": (name, PDF, "application/pdf")}, data=form)
+
+
+def retranslate_advanced(client, file_id, *, engine="gemini", **extra):
+    return client.post(f"/api/files/{file_id}/retranslate", json={"language": "vi", "engine": engine, "model": None, "font": "auto", **extra})
+
+
+TECHNICAL_STYLE = {"fidelity": "balanced", "tone": "professional", "audience": "expert", "terms": "keep", "proper_names": "keep",
+                   "numbers": "keep", "dates": "keep", "abbreviations": "keep",
+                   "custom_instructions": "Giữ nguyên tên thư viện, hàm, lệnh, tham số, tệp và mọi định danh trong mã."}
+
+
+def test_upload_with_a_profile_stores_a_value_snapshot_with_overrides(client, me):
+    save_key(client, "gemini")
+    enable_advanced(client)
+    technical = next(item for item in client.get("/api/profiles").json() if item["preset_slug"] == "technical")  # đã gieo: preset: → dòng của tôi
+    response = upload_advanced(client, profile="preset:technical", style={"tone": "friendly", "terms": "keep"}, context="Tài liệu API nội bộ.")
+    assert response.status_code == 202
+    item = response.json()
+    assert item["version_no"] == 1
+    assert item["config"] == {
+        "schema": 1, "mode": "advanced", "profile": {"id": technical["id"], "name": "Tài liệu kỹ thuật", "kind": "custom"},
+        "style": {**TECHNICAL_STYLE, "tone": "friendly"}, "overrides": ["tone"],  # terms=keep trùng hồ sơ → không phải ghi đè
+        "document_context": "Tài liệu API nội bộ."}
+    assert wait_file(client, item["id"])["config"] == item["config"]
+
+
+def test_upload_without_any_advanced_field_has_no_snapshot_even_in_advance_mode(client, me):
+    save_key(client, "gemini")
+    enable_advanced(client, default_profile="preset:quick")  # hồ sơ mặc định chỉ là gợi ý cho UI: server không tự áp
+    assert upload_advanced(client).json()["config"] is None
+    assert upload_advanced(client, style={}, context="").json()["config"] is None
+    assert upload(client, "thuan.pdf").json()["config"] is None
+
+
+def test_style_without_a_profile_keeps_only_the_sent_fields(client, me):
+    save_key(client, "gemini")
+    enable_advanced(client)
+    config = upload_advanced(client, style={"tone": "simple"}).json()["config"]
+    assert (config["profile"], config["style"], config["overrides"], config["document_context"]) == (None, {"tone": "simple"}, ["tone"], None)
+
+
+def test_advanced_fields_are_refused_when_the_mode_is_off_or_the_engine_is_not_ai(client, me):
+    save_key(client, "gemini")
+    response = upload_advanced(client, profile="preset:quick")
+    assert response.status_code == 400 and response.json() == {"detail": {"code": "advance_mode_off"}}
+    enable_advanced(client)
+    response = upload_advanced(client, engine="google_free", context="x")
+    assert response.status_code == 400 and response.json() == {"detail": {"code": "style_requires_ai"}}
+    assert client.get("/api/files").json()["total"] == 0  # kiểm trước khi ghi đĩa / xếp hàng
+    assert list(client.app.state.settings.users_dir.rglob("*.pdf")) == []
+
+
+def test_advanced_fields_are_refused_with_google_cloud_too(client, me):
+    """Cloud Translation v2 là dịch máy thuần (không nhận prompt) dù có key: cùng `style_requires_ai` như Google miễn phí."""
+    save_key(client, "gemini")  # chỉ để bật được chế độ (mặc định phải là AI); test này gửi engine google_cloud
+    save_key(client, "google_cloud")
+    enable_advanced(client)
+    extras = ({"profile": "preset:quick"}, {"style": {"tone": "simple"}}, {"context": "x"})
+    for extra in extras:
+        response = upload_advanced(client, engine="google_cloud", **extra)
+        assert response.status_code == 400 and response.json() == {"detail": {"code": "style_requires_ai"}}
+    assert client.get("/api/files").json()["total"] == 0
+    file_id = upload(client, "doc.pdf").json()["id"]
+    wait_file(client, file_id)
+    for extra in extras:
+        response = retranslate_advanced(client, file_id, engine="google_cloud", **extra)
+        assert response.status_code == 400 and response.json() == {"detail": {"code": "style_requires_ai"}}
+    item = client.get(f"/api/files/{file_id}").json()
+    assert (item["status"], item["retranslating"], item["config"]) == ("done", False, None)
+
+
+def test_advanced_fields_are_checked_before_the_pending_limit_and_before_any_write(client, me, settings):
+    save_key(client, "gemini")
+    file_id = upload(client, "doc.pdf").json()["id"]
+    wait_file(client, file_id)
+    with client.app.state.session_factory() as db:
+        instance_row(db).max_pending_per_user = 1
+        db.commit()
+    blocker = upload(client, "slow.pdf").json()["id"]
+    assert upload(client, "them.pdf").json() == {"detail": {"code": "too_many_pending", "limit": 1}}  # đã chạm hạn chờ
+    assert retranslate_advanced(client, file_id).json() == {"detail": {"code": "too_many_pending", "limit": 1}}
+    for response in (upload_advanced(client, context="x"), retranslate_advanced(client, file_id, profile="preset:quick")):
+        assert response.status_code == 400 and response.json() == {"detail": {"code": "advance_mode_off"}}
+    enable_advanced(client)
+    for response in (upload_advanced(client, style={"tone": "shouty"}), retranslate_advanced(client, file_id, style={"tone": "shouty"})):
+        assert response.status_code == 422 and response.json() == {"detail": {"code": "invalid_style", "field": "tone"}}
+    assert client.get("/api/files").json()["total"] == 2
+    assert sorted(path.name for path in (settings.users_dir / me["id"]).iterdir()) == sorted([file_id, blocker])  # không thư mục job mới
+    item = client.get(f"/api/files/{file_id}").json()
+    assert (item["status"], item["retranslating"], item["config"]) == ("done", False, None)
+    wait_file(client, blocker)
+
+
+@pytest.mark.parametrize(("kwargs", "status", "detail"), [
+    ({"profile": "preset:nope"}, 400, {"code": "profile_not_found"}),
+    ({"profile": "khac00000000"}, 400, {"code": "profile_not_found"}),
+    ({"style": "not json"}, 422, {"code": "invalid_style", "field": "style"}),
+    ({"style": "[1]"}, 422, {"code": "invalid_style", "field": "style"}),
+    ({"style": {"tone": "shouty"}}, 422, {"code": "invalid_style", "field": "tone"}),
+    ({"style": {"glossary": {}}}, 422, {"code": "invalid_style", "field": "glossary"}),
+    ({"style": {"custom_instructions": "x" * 1001}}, 422, {"code": "invalid_style", "field": "custom_instructions"}),
+    ({"context": "y" * 2001}, 422, {"code": "invalid_style", "field": "context"}),
+    ({"context": "a\x07b"}, 422, {"code": "invalid_style", "field": "context"}),
+    ({"style": "[" * 100_000 + "]" * 100_000}, 422, {"code": "invalid_style", "field": "style"}),  # RecursionError, không 500
+])
+def test_bad_advanced_fields_are_refused_with_the_field(client, me, kwargs, status, detail):
+    save_key(client, "gemini")
+    enable_advanced(client)
+    response = upload_advanced(client, **kwargs)
+    assert response.status_code == status and response.json() == {"detail": detail}
+    assert client.get("/api/files").json()["total"] == 0
+
+
+def test_an_empty_style_counts_as_not_sent_even_with_the_mode_off(client, me):
+    """Client khác gửi `style: {}` khi Chế độ nâng cao tắt: không có gì nâng cao → tệp cơ bản (config NULL), không 400."""
+    save_key(client, "gemini")
+    response = upload_advanced(client, style={})
+    assert response.status_code == 202 and response.json()["config"] is None
+    file_id = response.json()["id"]
+    wait_file(client, file_id)
+    response = retranslate_advanced(client, file_id, style={})
+    assert response.status_code == 202 and response.json()["config"] is None
+    assert wait_file(client, file_id)["config"] is None
+
+
+def test_another_users_profile_is_not_found_for_the_default_or_an_upload(client, sign_up):
+    sign_up("an@example.com")
+    theirs = client.post("/api/profiles", json={"name": "Của An", "tone": "friendly"}).json()["id"]
+    sign_up("binh@example.com")
+    save_key(client, "gemini")
+    body = {"default_engine": "google_free", "advance_mode": True, "default_profile": theirs}
+    response = client.put("/api/settings/preferences", json=body)
+    assert response.status_code == 400 and response.json() == {"detail": {"code": "profile_not_found"}}
+    enable_advanced(client)
+    response = upload_advanced(client, profile=theirs)
+    assert response.status_code == 400 and response.json() == {"detail": {"code": "profile_not_found"}}
+    assert client.get("/api/files").json()["total"] == 0
+
+
+def test_a_snapshot_survives_deleting_its_profile(client, me):
+    save_key(client, "gemini")
+    enable_advanced(client)
+    mine = client.post("/api/profiles", json={"name": "Riêng", "tone": "friendly"}).json()["id"]
+    item = upload_advanced(client, profile=mine).json()
+    assert client.delete(f"/api/profiles/{mine}").status_code == 204
+    again = client.get(f"/api/files/{item['id']}").json()
+    assert again["config"]["profile"] == {"id": mine, "name": "Riêng", "kind": "custom"} and again["config"]["style"]["tone"] == "friendly"
+    response = upload_advanced(client, profile=mine)
+    assert response.status_code == 400 and response.json() == {"detail": {"code": "profile_not_found"}}
+
+
+def test_retranslate_a_done_file_parks_the_new_snapshot_until_the_new_translation_is_ready(client, me):
+    save_key(client, "gemini")
+    enable_advanced(client)
+    rows = {item["preset_slug"]: item["id"] for item in client.get("/api/profiles").json()}
+    file_id = upload_advanced(client, profile="preset:quick").json()["id"]
+    wait_file(client, file_id)
+    blocker = upload(client, "slow.pdf").json()["id"]  # worker giả ngủ 3 s: lượt dịch lại xếp hàng sau nó
+    wait_file(client, blocker, statuses=("running",))
+    item = retranslate_advanced(client, file_id, profile="preset:academic", context="Luận văn.").json()
+    assert item["status"] == "queued" and item["config"]["profile"]["id"] == rows["quick"]  # bản chính vẫn mang snapshot cũ
+    with client.app.state.session_factory() as db:
+        parked = json.loads(db.get(File, file_id).retranslate_config)
+    assert parked["profile"]["id"] == rows["academic"] and parked["document_context"] == "Luận văn."
+    done = wait_file(client, file_id)
+    assert done["config"]["profile"]["id"] == rows["academic"] and done["config"]["document_context"] == "Luận văn."
+    with client.app.state.session_factory() as db:
+        assert db.get(File, file_id).retranslate_config is None
+    wait_file(client, blocker)
+
+
+def test_a_failed_retranslate_drops_the_parked_snapshot_and_keeps_the_current_one(client, me):
+    save_key(client, "gemini")
+    enable_advanced(client)
+    file_id = upload_advanced(client, "rebuildfail.pdf", context="Cũ").json()["id"]
+    wait_file(client, file_id)
+    assert retranslate_advanced(client, file_id, context="Mới").status_code == 202
+    item = wait_file(client, file_id)
+    assert item["status"] == "done" and item["rebuild_error"] and item["config"]["document_context"] == "Cũ"
+    with client.app.state.session_factory() as db:
+        assert db.get(File, file_id).retranslate_config is None
+
+
+def test_retranslate_a_failed_file_writes_the_new_snapshot_in_place(client, me):
+    save_key(client, "gemini")
+    enable_advanced(client)
+    file_id = upload_advanced(client, "fail.pdf", context="Cũ").json()["id"]
+    wait_file(client, file_id)
+    item = retranslate_advanced(client, file_id, context="Mới").json()
+    assert item["status"] == "queued" and item["config"]["document_context"] == "Mới"
+    assert wait_file(client, file_id)["config"]["document_context"] == "Mới"  # lại lỗi (worker giả): snapshot vẫn của lượt vừa yêu cầu
+    assert retranslate_advanced(client, file_id).json()["config"] is None  # không gửi gì → về cơ bản
+
+
+def test_retranslate_refuses_advanced_fields_like_upload(client, me):
+    save_key(client, "gemini")
+    file_id = upload(client, "doc.pdf").json()["id"]
+    wait_file(client, file_id)
+    assert retranslate_advanced(client, file_id, context="x").json() == {"detail": {"code": "advance_mode_off"}}
+    enable_advanced(client)
+    assert retranslate_advanced(client, file_id, engine="google_free", profile="preset:quick").json() == {"detail": {"code": "style_requires_ai"}}
+    response = retranslate_advanced(client, file_id, style={"numbers": "roman"})
+    assert response.status_code == 422 and response.json() == {"detail": {"code": "invalid_style", "field": "numbers"}}
+    assert client.get(f"/api/files/{file_id}").json()["status"] == "done"
+
+
+def test_bulk_retranslate_keeps_each_files_snapshot_only_for_ai_engines(client, me):
+    save_key(client, "gemini")
+    enable_advanced(client)
+    ids = seed_rows(client, me["id"], [("done-ai.pdf", "done", 0), ("error-ai.pdf", "error", 1), ("done-plain.pdf", "done", 2)])
+    client.app.state.runner.stop()  # chỉ kiểm phần service: tệp nằm lại hàng đợi
+    snap = json.dumps({"schema": 1, "mode": "advanced", "profile": None, "style": None, "overrides": [], "document_context": "Ngữ cảnh"})
+
+    def reset():
+        with client.app.state.session_factory() as db:
+            db.execute(update(File).where(File.id == ids[0]).values(status="done"))
+            db.execute(update(File).where(File.id == ids[1]).values(status="error"))
+            db.execute(update(File).where(File.id == ids[2]).values(status="done"))
+            db.execute(update(File).where(File.id.in_(ids)).values(retranslate_language=None, retranslate_engine=None,
+                                                                   retranslate_model=None, rebuild_font=None, retranslate_config=None))
+            db.execute(update(File).where(File.id.in_(ids[:2])).values(engine="gemini", model="gemini-3.5-flash-lite", config=snap))
+            db.commit()
+
+    def parked():
+        with client.app.state.session_factory() as db:
+            return [(db.get(File, file_id).config, db.get(File, file_id).retranslate_config) for file_id in ids]
+
+    # Giữ cài đặt riêng: tệp AI giữ snapshot của chính nó (done → đỗ ở retranslate_config, error → giữ config); tệp thuần không có gì.
+    reset()
+    assert bulk_retranslate(client, {"ids": ids, "settings": None}).json()["queued"] == 3
+    assert parked() == [(snap, snap), (snap, None), (None, None)]
+    # Áp một cài đặt với động cơ THUẦN: lượt này chạy cơ bản — snapshot của lượt = NULL; bản hiện tại vẫn mang config tới khi bị thay.
+    reset()
+    plain = {"language": "vi", "engine": "google_free", "model": None, "font": "auto"}
+    assert bulk_retranslate(client, {"ids": ids, "settings": plain}).json()["queued"] == 3
+    assert parked() == [(snap, None), (None, None), (None, None)]  # tệp error tại chỗ: config về NULL
+    # Áp một cài đặt với động cơ AI: mọi tệp giữ snapshot hiện có — đổi model hàng loạt không mất ngữ cảnh riêng.
+    reset()
+    ai = {"language": "vi", "engine": "gemini", "model": "gemini-3.8-flash", "font": "auto"}
+    assert bulk_retranslate(client, {"ids": ids, "settings": ai}).json()["queued"] == 3
+    assert parked() == [(snap, snap), (snap, None), (None, None)]
+    # Chế độ nâng cao tắt: không giữ gì.
+    reset()
+    assert client.put("/api/settings/preferences", json={"default_engine": "google_free", "advance_mode": False}).status_code == 200
+    assert bulk_retranslate(client, {"ids": ids, "settings": None}).json()["queued"] == 3
+    assert parked() == [(snap, None), (None, None), (None, None)]
+
+
+# ---- Phiên bản (spec 2026-10-14 §5, §7) ------------------------------------------------------------------------
+
+
+def test_file_detail_lists_versions_newest_first_and_serves_an_old_one(client, me):
+    file_id = upload(client, "doc.pdf").json()["id"]
+    wait_file(client, file_id)
+    first = client.get(f"/api/files/{file_id}/download").content
+    item = client.get(f"/api/files/{file_id}").json()
+    assert item["version_no"] == 1 and item["versions"] == []
+    assert "versions" not in client.get("/api/files").json()["items"][0]  # danh sách chỉ có version_no
+    assert retranslate(client, file_id, language="en", font="serif").status_code == 202
+    wait_file(client, file_id)
+    assert retranslate(client, file_id, language="vi", font="sans").status_code == 202
+    detail = wait_file(client, file_id)
+    assert detail["version_no"] == 3 and [version["version_no"] for version in detail["versions"]] == [2, 1]
+    v1 = detail["versions"][1]
+    assert (v1["language"], v1["engine"], v1["model"], v1["font"], v1["available"], v1["config"]) == ("vi", "google_free", None, "auto", True, None)
+    assert v1["archived_at"].endswith("Z") and v1["finished_at"] is None
+    response = client.get(f"/api/files/{file_id}/versions/{v1['id']}/download")
+    assert response.status_code == 200 and response.content == first
+    assert "doc-vi-v1.pdf" in response.headers["content-disposition"] and response.headers["cache-control"] == "no-store"
+    inline = client.get(f"/api/files/{file_id}/versions/{v1['id']}/download", params={"inline": 1})
+    assert inline.headers["content-disposition"].startswith("inline") and inline.headers["x-content-type-options"] == "nosniff"
+
+
+def test_version_download_is_scoped_to_the_file_and_its_owner_and_reports_missing_files(client, me, sign_up, settings):
+    file_id = upload(client, "doc.pdf").json()["id"]
+    wait_file(client, file_id)
+    retranslate(client, file_id, language="en")
+    [version] = wait_file(client, file_id)["versions"]
+    other_file = upload(client, "khac.pdf").json()["id"]
+    wait_file(client, other_file)
+    response = client.get(f"/api/files/{other_file}/versions/{version['id']}/download")
+    assert response.status_code == 404 and response.json() == {"detail": {"code": "version_not_found"}}
+    assert client.get(f"/api/files/{file_id}/versions/nope00000000/download").status_code == 404
+    (file_dir(settings.users_dir, me["id"], file_id) / "versions" / version["id"] / "doc-vi.pdf").unlink()
+    assert client.get(f"/api/files/{file_id}").json()["versions"][0]["available"] is False
+    gone = client.get(f"/api/files/{file_id}/versions/{version['id']}/download")
+    assert gone.status_code == 410 and gone.json() == {"detail": {"code": "gone"}}
+    sign_up("binh@example.com")
+    assert client.get(f"/api/files/{file_id}/versions/{version['id']}/download").json() == {"detail": {"code": "not_found"}}  # tệp của người khác
+
+
+def test_deleting_a_file_removes_its_version_rows_and_folder(client, me, settings):
+    file_id = upload(client, "doc.pdf").json()["id"]
+    wait_file(client, file_id)
+    retranslate(client, file_id, language="en")
+    assert len(wait_file(client, file_id)["versions"]) == 1
+    directory = file_dir(settings.users_dir, me["id"], file_id)
+    assert (directory / "versions").is_dir()
+    assert client.delete(f"/api/files/{file_id}").status_code == 204
+    assert not directory.exists()
+    with client.app.state.session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(FileVersion).where(FileVersion.file_id == file_id)) == 0  # FK CASCADE
+
+
+def test_items_carry_translated_at_and_the_restore_fields_and_versions_inherit_them(client, me):
+    assert upload(client, "b.pdf").json()["translated_at"] is None  # chưa xong
+    file_id = upload(client, "doc.pdf").json()["id"]
+    first = wait_file(client, file_id)
+    assert first["translated_at"] == first["finished_at"] and first["translated_at"].endswith("Z")
+    assert (first["restored_from"], first["restoring"], first["restore_version"]) == (None, False, None)
+    listed = next(item for item in client.get("/api/files").json()["items"] if item["id"] == file_id)
+    assert (listed["translated_at"], listed["restoring"], listed["restored_from"]) == (first["translated_at"], False, None)
+    assert retranslate(client, file_id, language="en").status_code == 202
+    detail = wait_file(client, file_id)
+    [version] = detail["versions"]
+    assert (version["translated_at"], version["restored_from"]) == (first["translated_at"], None)
+    assert detail["translated_at"] >= first["translated_at"]
+
+
+def test_version_items_say_whether_their_segment_table_travelled_with_them(client, me, settings):
+    save_key(client, "gemini")
+    file_id = upload(client, "newtable.pdf", engine="gemini").json()["id"]  # lần dịch đầu: worker giả KHÔNG ghi bảng
+    wait_file(client, file_id)
+    assert retranslate(client, file_id, language="en", engine="gemini", model="gemini-3.5-flash-lite").status_code == 202
+    wait_file(client, file_id)  # dịch lại: worker giả ghi bảng mới vào rebuild/ → bản 2 (bản hiện tại lúc này) có bảng
+    assert retranslate(client, file_id, language="vi", engine="gemini", model="gemini-3.5-flash-lite").status_code == 202
+    newest, oldest = wait_file(client, file_id)["versions"]
+    assert (newest["version_no"], newest["has_tables"]) == (2, True)
+    assert (oldest["version_no"], oldest["has_tables"]) == (1, False)
+    assert (file_dir(settings.users_dir, me["id"], file_id) / "versions" / newest["id"] / "segments.jsonl").is_file()
+
+
+# ---- Khôi phục bản cũ (spec 2026-10-15 §2, §8) ------------------------------------------------------------------
+
+
+def restore(client, file_id, version_id):
+    return client.post(f"/api/files/{file_id}/versions/{version_id}/restore")
+
+
+def test_restore_copies_an_old_version_into_place_as_a_new_version_and_the_item_says_so_meanwhile(client, me):
+    file_id = upload(client, "doc.pdf").json()["id"]
+    first = wait_file(client, file_id)
+    first_pdf = client.get(f"/api/files/{file_id}/download").content
+    assert retranslate(client, file_id, language="en", font="serif").status_code == 202
+    [v1] = wait_file(client, file_id)["versions"]
+    blocker = upload(client, "slow.pdf").json()["id"]  # worker giả ngủ 3 s: lượt khôi phục xếp hàng sau nó, phản hồi chắc chắn "queued"
+    wait_file(client, blocker, statuses=("running",))
+    response = restore(client, file_id, v1["id"])
+    assert response.status_code == 202, response.text
+    queued = response.json()
+    assert (queued["status"], queued["restoring"], queued["restore_version"], queued["retranslating"]) == ("queued", True, v1["id"], True)
+    assert queued["retranslate_to"] == {"language": "vi", "engine": "google_free", "model": None, "font": "auto"}
+    done = wait_file(client, file_id)
+    assert (done["version_no"], done["restored_from"], done["language"], done["font"], done["restoring"], done["restore_version"]) == (
+        3, 1, "vi", "auto", False, None)
+    assert done["translated_at"] >= first["translated_at"] and done["config"] is None
+    assert [(version["version_no"], version["restored_from"]) for version in done["versions"]] == [(2, None), (1, None)]
+    assert client.get(f"/api/files/{file_id}/download").content == first_pdf  # bản sao của Bản 1
+    assert next(item for item in client.get("/api/files").json()["items"] if item["id"] == file_id)["restoring"] is False
+    wait_file(client, blocker)
+
+
+def test_restore_is_refused_for_unknown_versions_full_queues_missing_files_pending_files_and_other_people(client, me, sign_up, settings):
+    file_id = upload(client, "doc.pdf").json()["id"]
+    wait_file(client, file_id)
+    assert retranslate(client, file_id, language="en").status_code == 202
+    [version] = wait_file(client, file_id)["versions"]
+    other_file = upload(client, "khac.pdf").json()["id"]
+    wait_file(client, other_file)
+    assert restore(client, other_file, version["id"]).json() == {"detail": {"code": "version_not_found"}}
+    assert restore(client, file_id, "nope00000000").status_code == 404
+    with client.app.state.session_factory() as db:
+        instance_row(db).max_pending_per_user = 0
+        db.commit()
+    full = restore(client, file_id, version["id"])
+    assert full.status_code == 429 and full.json() == {"detail": {"code": "too_many_pending", "limit": 0}}
+    with client.app.state.session_factory() as db:
+        instance_row(db).max_pending_per_user = None
+        db.commit()
+    path = file_dir(settings.users_dir, me["id"], file_id) / "versions" / version["id"] / "doc-vi.pdf"
+    data = path.read_bytes()
+    path.unlink()
+    gone = restore(client, file_id, version["id"])
+    assert gone.status_code == 410 and gone.json() == {"detail": {"code": "gone"}}
+    path.write_bytes(data)
+    client.app.state.runner.stop()  # trạng thái chèn tay phải đứng yên
+    for status in ("error", "queued", "running"):
+        with client.app.state.session_factory() as db:
+            db.execute(update(File).where(File.id == file_id).values(status=status))
+            db.commit()
+        refused = restore(client, file_id, version["id"])
+        assert refused.status_code == 409 and refused.json() == {"detail": {"code": "not_restorable"}}
+    with client.app.state.session_factory() as db:
+        db.execute(update(File).where(File.id == file_id).values(status="done"))
+        db.commit()
+    item = client.get(f"/api/files/{file_id}").json()
+    assert (item["status"], item["restoring"]) == ("done", False)  # không có gì bị xếp hàng
+    sign_up("binh@example.com")
+    assert restore(client, file_id, version["id"]).json() == {"detail": {"code": "not_found"}}
+
+
+def test_restore_refuses_a_file_the_runner_takes_between_the_checks_and_the_update(client, me, monkeypatch):
+    """UPDATE có điều kiện `status='done'`: luồng chạy / lượt bấm khác đổi trạng thái SAU mọi phép kiểm → 409, không xếp gì."""
+    file_id = upload(client, "doc.pdf").json()["id"]
+    wait_file(client, file_id)
+    assert retranslate(client, file_id, language="en").status_code == 202
+    [version] = wait_file(client, file_id)["versions"]
+    client.app.state.runner.stop()
+    real = service._check_pending
+
+    def racing(db, cfg, user_id):
+        real(db, cfg, user_id)  # mọi phép kiểm đã qua …
+        with client.app.state.session_factory() as other:  # … rồi runner nhận tệp ngay trước UPDATE
+            other.execute(update(File).where(File.id == file_id).values(status="running"))
+            other.commit()
+
+    monkeypatch.setattr(service, "_check_pending", racing)
+    response = restore(client, file_id, version["id"])
+    assert response.status_code == 409 and response.json() == {"detail": {"code": "not_restorable"}}
+    with client.app.state.session_factory() as db:
+        row = db.get(File, file_id)
+        assert (row.status, row.restore_version, row.rebuild_font, row.retranslate_language, row.retranslate_engine) == (
+            "running", None, None, None, None)
 
 
 def test_list_paginates_newest_first(client, me):
@@ -898,6 +1345,8 @@ def test_bulk_retranslate_with_bad_settings_queues_nothing(client, me, shared, c
     {}, {"ids": []}, {"ids": ["a"], "all": True}, {"all": False}, {"ids": ["a", "a"]}, {"ids": [f"id{n}" for n in range(101)]},
     {"all": True, "settings": {"language": "vi"}}, {"ids": ["a"], "extra": 1},
     {"all": True, "settings": {"language": "vi", "engine": "google_free", "font": "auto", "extra": 1}},
+    {"all": True, "profile": "preset:quick"},
+    {"all": True, "settings": {"language": "vi", "engine": "google_free", "font": "auto", "profile": "preset:quick"}},
 ])
 def test_bulk_retranslate_rejects_bad_bodies(client, me, body):
     seed_rows(client, me["id"], [("1.pdf", "done", 0)])

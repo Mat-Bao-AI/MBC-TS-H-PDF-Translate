@@ -41,3 +41,7 @@ export function holdRequests(fetchMock: ReturnType<typeof mockApi>['fetchMock'],
   });
   return { release };
 }
+
+/** Thân JSON của mọi request `method url` đã gọi, theo thứ tự. */
+export const bodies = (calls: Call[], method: string, url: string) =>
+  calls.filter((call) => call.method === method && call.url === url).map((call) => JSON.parse(String(call.body)));

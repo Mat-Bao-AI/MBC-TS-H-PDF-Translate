@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -17,6 +19,8 @@ class PreferencesBody(BaseModel):
     default_engine: str
     default_model: str | None = None
     default_font: str | None = None  # auto|sans|serif; bỏ qua = giữ nguyên
+    advance_mode: bool | None = None  # bỏ qua = giữ nguyên (spec 2026-10-14 §7)
+    default_profile: Any = None  # phân biệt bỏ qua / null qua model_fields_set; kiểu lỏng → service trả profile_not_found
 
 
 class KeyBody(BaseModel):
@@ -34,8 +38,9 @@ def get_settings(request: Request, user: User = Depends(current_user), db: Sessi
 
 @router.put("/preferences")
 def put_preferences(body: PreferencesBody, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
-    return credentials.set_preferences(db, _secret(request), user, body.default_engine, body.default_model,
-                                       body.default_font)
+    return credentials.set_preferences(db, _secret(request), user, body.default_engine, body.default_model, body.default_font,
+                                       advance_mode=body.advance_mode, default_profile=body.default_profile,
+                                       default_profile_set="default_profile" in body.model_fields_set)
 
 
 @router.put("/credentials/{provider}")

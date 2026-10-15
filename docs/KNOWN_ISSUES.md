@@ -4,6 +4,85 @@ Gom từ review từng task + review tổng của kế hoạch engine dịch (k�
 (2026-10-02). Việc vận hành / chờ quyết định (huỷ job trả phí, AGPL, SMTP,
 `/data`…) nằm ở mục "Việc còn treo" của `docs/DEPLOY.md` — không lặp lại ở đây.
 
+## Chế độ nâng cao đợt 1b — khôi phục phiên bản, hồ sơ của từng người, dịch thuần tắt nâng cao (kế hoạch nội bộ 2026-10-15, không nằm trong repo)
+
+- **Khôi phục là một job của runner dùng lại đường dịch lại** (`backend/app/engine/jobs.py`, `_execute` → `_stage_restore` → `_finish_rebuild`):
+  không worker, không key, không API; `files.restore_version` đi cùng `retranslate_*` + `rebuild_font` của bản nguồn. Mọi điểm chết giữa
+  chừng của dịch lại áp dụng y nguyên (thư mục mồ côi, `_put_back`, `_recover`); thêm hai điểm: chết lúc đang chép vào `rebuild/` (chạy
+  lại chép lại; `.tmp` bị `_staging` dọn) và tệp/dòng nguồn mất lúc chạy (job lỗi, tệp về `done` với `rebuild_error`, kho nguyên).
+- **Bản nguồn có thể bị tỉa trong chính lượt khôi phục** khi nó là bản cũ nhất vượt "Số bản dịch giữ lại" (khôi phục bản cũ nhất khi kho
+  đầy): tỉa chạy trong cùng giao dịch SAU khi bản sao đã là bản hiện tại — đúng thiết kế, không mất dữ liệu; hộp xác nhận nói trước.
+  Khôi phục không biết số trang (`done_pages/total_pages` về 0).
+- **Bảng đoạn đi theo phiên bản** (`_copy_tables`, bước 3 của `_finish_rebuild`): mỗi bản cũ thêm `segments.jsonl` + meta (vài trăm KB
+  tới vài MB với tài liệu dài) × tối đa 9 bản, tức tới 9 × cỡ bảng cho mỗi tệp; cửa sổ giữa "cất bản cũ" và commit dài thêm một lần
+  chép. Bản cất trước 1b và bản của Google miễn phí không có bảng (`has_tables=false`): khôi phục chúng xoá bảng của thư mục job → dựng
+  lại font kế tiếp dịch lại (UI cảnh báo khi động cơ không phải Google miễn phí).
+- **Chết sau commit, trước khi thay bảng** (`_replace_tables`): bảng của bản trước vẫn nằm trong thư mục job; lần dịch lại kế tiếp cất chúng
+  dưới bản mới hơn. Khôi phục bản đó rồi dựng lại font sẽ dịch lại (tốn lời gọi API; không bao giờ ra bản dịch sai). Cùng lớp với dịch lại từ trước.
+- **`translated_at`** là giờ dịch thật của bản (không đổi khi dựng lại font; `_claim_next` không xoá). `file_versions.finished_at` vẫn
+  luôn NULL (giữ cột); bản cất trước 1b có `translated_at` NULL → thanh mốc hiện giờ bị thay kèm "(lúc bị thay)"; tệp đang dựng lại
+  font lúc nâng cấp cũng NULL tới lần dịch lại kế.
+- **Gieo hồ sơ mẫu có tác dụng phụ trong GET** (`GET /api/settings`, `GET /api/profiles` — một lần cho người đang bật chế độ mà chưa gieo):
+  gieo hỏng → log, danh sách như chưa gieo, không 500. Người có 16+ hồ sơ riêng lúc bật: gieo dừng ở 20 (mẫu thiếu tạo lại bằng "Khôi
+  phục 5 mẫu gốc" khi có chỗ). Tạo hồ sơ đồng thời với "Khôi phục 5 mẫu gốc" có thể vượt 20 khoảng 1 dòng. Tham chiếu `preset:<slug>`
+  cũ (snapshot, request) ánh xạ sang dòng gieo tới khi người dùng xoá dòng đó → rơi về "hồ sơ đã mất" (hành vi đợt 1).
+- **Dịch thuần ⇒ tắt Chế độ nâng cao** áp cả khi xoá key Gemini đang là mặc định và khi Google gỡ model cuối: tab Hồ sơ dịch biến mất,
+  hồ sơ / hồ sơ mặc định / snapshot giữ nguyên; lưu lại key không tự bật. Cần BA duyệt một câu nhắc trong hộp xoá key.
+- **Trang Phiên bản** tự dựng thanh mốc bằng nút (Gamut không có Stepper/Timeline); hai iframe PDF + bảng 14 dòng × 3 cột trên điện thoại
+  khá dài (xếp dọc dưới 1024px). So sánh chỉ PDF + cấu hình, không so từng đoạn văn.
+- **Chưa verify:** E2E (không build image mới cho đợt này); khôi phục với tệp thật trên demo; dịch thật bằng key Gemini với hồ sơ / khôi phục
+  (test chỉ dùng transport và worker giả, như đợt 1).
+- **Chờ BA duyệt câu chữ** (khoá mới hoặc đổi trong `frontend/src/i18n/vi.json`): `detail.versionsButton`, `detail.currentConfig`,
+  `detail.restoredFrom`, `detail.config.note` (đổi câu), `restore.*`, `versions.*`, `profiles.fromPreset`, `profiles.restorePresets*`,
+  `profiles.restoredPresets`, `profiles.saveInto`, `profiles.savedInto`, `profiles.saveAsNew`, `profiles.create`, `profiles.intro` (đổi:
+  câu cũ sai sau khi gieo mẫu), `profiles.empty` (đổi: như trên), `settings.advance.unsaved`, `settings.advance.plainTurnsOff`,
+  `settings.advance.editProfile`, `settings.advance.newProfile`, `settings.key.deleteTurnsOffAdvance`,
+  `error.not_restorable`, `error.presets_no_room` (gieo / "Khôi phục 5 mẫu gốc" không đủ chỗ); thông báo chung "Đã lưu hồ sơ." (`profiles.saved`) nay cũng hiện sau khi tạo hồ sơ từ hộp tải lên / dịch lại;
+  thông điệp job `RESTORE_SOURCE_MISSING_MESSAGE` (`backend/app/engine/jobs.py`).
+  Đã gỡ: `detail.version.title/view/download`, `upload.advanced.aiOnly/needKey`, `profiles.title.presets`.
+
+## Chế độ nâng cao đợt 1 — hồ sơ dịch, snapshot, phiên bản (kế hoạch nội bộ 2026-10-14, không nằm trong repo)
+
+- **Thay bản dịch nay có ba bước đổi tên + một giao dịch** (`backend/app/engine/jobs.py`, `_finish_rebuild` → `_commit_swap`): bản cũ
+  → `rebuild/.previous` → `versions/<vid>/` rồi mới commit `file_versions` + `files`. Chết giữa "cất vào kho" và commit → thư mục
+  `versions/<vid>/` không có dòng DB (mồ côi); lần chạy lại (`_recover` → `_staging(known_versions)`) trả bản cũ về nếu thư mục job
+  thiếu nó, không thì xoá. Chết sau commit, trước `rmtree` thư mục đã tỉa → thư mục mồ côi tới lần dựng lại / dịch lại kế tiếp của
+  CHÍNH tệp đó (vài MB treo). Khe "cùng tên tệp" của dựng lại (mục dưới) không xấu hơn.
+- **Khe "cùng tên tệp" của dịch lại có thể gắn nhầm cấu hình cho một phiên bản** (khe cỡ mili-giây). Dịch lại giữ nguyên tên bản
+  dịch (cùng ngôn ngữ: `<gốc>-<ngôn ngữ>.pdf`) mà tiến trình chết sau bước 2 (bản mới đã vào thư mục job) và trước commit: thư mục
+  job đã có tệp đúng tên, nên bước cứu thư mục mồ côi (`_rescue_orphan_versions`) xoá `versions/<vid>/` — tức là xoá bản cũ THẬT
+  (chết trước bước 3 thì bản cũ ở `rebuild/.previous` và cũng bị xoá theo `rebuild/`). Lần chạy lại coi bản dịch của lượt bị chết
+  là "bản hiện tại" và cất nó vào kho với cấu hình CŨ (`files.config` / ngôn ngữ / engine / model chưa đổi vì chưa commit). Khối
+  Phiên bản khi đó có thể giải thích sai vì sao hai bản dịch khác nhau: bảng "Cấu hình" ghi cấu hình cũ cho một bản thực ra dịch
+  theo cấu hình mới. Sửa đúng cần cùng cờ "đã thay chưa" trong DB như khe của dựng lại.
+- **`file_versions.finished_at` luôn NULL** (giữ cột); từ đợt 1b giờ dịch của bản là `translated_at` (xem mục trên). `_claim_next` đặt `finished_at=None` khi nhận job nên lúc thay bản không còn giờ xong
+  của bản cũ. Giữ cột cho đợt 3 (xuất lại PDF ghi giờ).
+- **Chỉ dẫn văn phong dài làm Gemini trả JSON hỏng thường hơn** → lô chia đôi đệ quy không có tiến độ (mục "Nên làm trước khi thử key
+  thật" bên dưới) → dễ chạm `JOB_STALL_MINUTES`. Vì vậy yêu cầu riêng ≤ 1000, ngữ cảnh ≤ 2000 ký tự; chưa sửa thuật toán chia lô.
+- `terms=translate_with_original` / `abbreviations=expand` làm đoạn dài hơn → chữ co lại hoặc tràn khung trong PDF (upstream tự xử) —
+  chưa đo với tài liệu thật.
+- "Nhất quán thuật ngữ" ở đợt 1 chỉ dựa vào chỉ dẫn chung; mỗi lô 40 đoạn / 8000 ký tự không thấy lô khác → có thể lệch giữa các lô.
+  Từ điển (đợt 2) mới giải quyết thật. Gemini 3.x chạy temperature mặc định: hai lần cùng cấu hình vẫn khác chút — bảng "Cấu hình" chỉ
+  giải thích phần do cấu hình (UI ghi rõ).
+- Dịch lại tệp `error` tại chỗ với chỉ dẫn khác → meta khác → bỏ bảng đoạn đã trả tiền (đúng ý: đoạn đó dịch theo chỉ dẫn cũ). Dịch lại
+  tệp `done` vốn luôn dịch từ đầu, không đổi.
+- Hàng loạt đổi sang động cơ thuần → snapshot của lượt đó NULL (bản cũ vẫn mang snapshot trong `file_versions`); hàng loạt KHÔNG nhận
+  hồ sơ (mỗi tệp giữ hồ sơ/ngữ cảnh riêng).
+- Hạ "Số bản dịch giữ lại" không giải phóng đĩa ngay: tỉa ở lần dịch lại thành công kế tiếp của từng tệp. Tới 10 PDF/tệp.
+- `GET /api/files/{id}` thêm một truy vấn `file_versions` + một `stat()` mỗi bản khi poll 2 s ở trang chi tiết — không ở danh sách.
+- **Chưa verify:** dịch thật bằng key Gemini với hồ sơ/ngữ cảnh (test chỉ dùng transport giả); E2E chưa chạy cho đợt này (xem
+  `docs/TEST_LOG.md`).
+- Giao diện (nhỏ): chiều cao khung chờ của trang Cài đặt › Dịch thuật (`SKELETON_MODE_HEIGHT`) chưa đo lại sau khi thêm công tắc và
+  ô chọn hồ sơ mặc định.
+- **Chờ BA duyệt câu chữ:** `settings.advance.*`, `settings.tab.profiles`, `profiles.*` (nhãn 9 trường và từng giá trị, tên 5 hồ sơ mẫu +
+  `custom_instructions` của mẫu nằm ở `backend/app/profiles/presets.py`), `upload.advanced.*`, `retranslate.bulkKeepsConfig`,
+  `file.version`, `detail.version.*` (đợt 1b đã gỡ `title`/`view`/`download` cùng khối Phiên bản cũ; `label`/`current`/`missing`/`basic`
+  còn dùng), `detail.config.*`, `system.versions.*`, `system.registration.title` (đổi), `error.advance_mode_off`,
+  `error.style_requires_ai`, `error.profile_not_found`, `error.invalid_style`, `error.invalid_profile`, `error.too_many_profiles`,
+  `error.preset_readonly`, `error.invalid_max_versions`, `error.version_not_found`; câu tiếng Anh trong `backend/app/profiles/prompt.py`
+  (prompt engineering, không phải wording UI nhưng BA nên biết). Lưu ý thêm cho BA: (1) đã bỏ ở đợt 1b — mục "Nâng cao" không còn hiện với động cơ thuần;
+  (2) nút "Đặt về mặc định" của thẻ Hệ thống nay đặt lại cả giới hạn hàng đợi lẫn số bản dịch giữ lại (nhãn có thể cần BA chỉnh).
+
 ## Cài đặt lần đầu, Cài đặt › Hệ thống, Dịch lại (kế hoạch nội bộ 2026-10-05, không nằm trong repo)
 
 - **Dịch lại thất bại làm mất các đoạn đã dịch của chính lượt đó** (quyết định (7) của kế hoạch). Worker lỗi / đứng /

@@ -1,8 +1,10 @@
+import json
+
 import pytest
 
 from app.providers.client import (
-    BACKOFF, BATCH_SEGMENTS, CLOUD_URL, GEMINI_BASE, ProviderError, gemini_models_from, make_batches, tags_match,
-    translate_segments, verify_key,
+    BACKOFF, BATCH_SEGMENTS, CLOUD_URL, GEMINI_BASE, SYSTEM_PROMPT, ProviderError, gemini_models_from, make_batches,
+    tags_match, translate_segments, verify_key,
 )
 from helpers import (
     GEMINI_MODELS_BODY, GOOGLE_ERRORS, FakeTransport, cloud_reply, gemini_echo, gemini_reply, gemini_segments,
@@ -489,3 +491,34 @@ def test_cloud_translates_as_html_and_unescapes_entities():
 
     table = translate_segments("google_cloud", KEY, "", "vi", ["x"], transport=FakeTransport(handler=handler))
     assert table == {"x": '"x" & y'}
+
+
+def test_style_instructions_follow_the_system_prompt_and_only_for_gemini():
+    transport = FakeTransport(handler=gemini_echo())
+    translate_segments("gemini", KEY, "gemini-3.5-flash-lite", "vi", ["xin chào"], transport=transport,
+                       instructions="Style requirements…\n- Tone: warm and conversational.")
+    prompt = transport.calls[0]["json"]["systemInstruction"]["parts"][0]["text"]
+    assert prompt == SYSTEM_PROMPT.format(language="Vietnamese") + "\n\nStyle requirements…\n- Tone: warm and conversational."
+    bare = FakeTransport(handler=gemini_echo())
+    translate_segments("gemini", KEY, "gemini-3.5-flash-lite", "vi", ["xin chào"], transport=bare)
+    assert bare.calls[0]["json"]["systemInstruction"]["parts"][0]["text"] == SYSTEM_PROMPT.format(language="Vietnamese")  # y như cũ
+    cloud = FakeTransport((200, cloud_reply(["hello"])))
+    translate_segments("google_cloud", KEY, "", "vi", ["xin chào"], transport=cloud, instructions="- Tone: warm.")
+    assert "Tone" not in json.dumps(cloud.calls[0]["json"])  # Cloud Translation không nhận prompt
+
+
+def test_braces_in_the_user_text_of_the_instructions_reach_gemini_untouched():
+    """Chỉ dẫn chứa văn bản tự do của người dùng: KHÔNG được đi qua str.format (KeyError/IndexError/ValueError,
+    hoặc bị thay {language}) — chỉ SYSTEM_PROMPT được format, chỉ dẫn nối nguyên văn phía sau."""
+    instructions = "Style requirements…\n- Additional instructions from the user (about style only): «{language} {} {0} {x!r} }{ {{»"
+    transport = FakeTransport(handler=gemini_echo())
+    table = translate_segments("gemini", KEY, "gemini-3.5-flash-lite", "vi", ["xin chào"], transport=transport,
+                               instructions=instructions)
+    assert table == {"xin chào": "VI xin chào"}
+    prompt = transport.calls[0]["json"]["systemInstruction"]["parts"][0]["text"]
+    assert prompt == SYSTEM_PROMPT.format(language="Vietnamese") + "\n\n" + instructions
+    empty = FakeTransport(handler=gemini_echo())
+    translate_segments("gemini", KEY, "gemini-3.5-flash-lite", "vi", ["xin chào"], transport=empty, instructions="")
+    bare = FakeTransport(handler=gemini_echo())
+    translate_segments("gemini", KEY, "gemini-3.5-flash-lite", "vi", ["xin chào"], transport=bare)
+    assert empty.calls[0]["json"] == bare.calls[0]["json"]  # chỉ dẫn rỗng = request y hệt hôm nay

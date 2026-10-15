@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Anchor, Box, FlexBox, Tab, TabList, TabPanel, TabPanels, Tabs } from '@codecademy/gamut';
 import { filesApi, type DownloadKind, type FileItem } from '../api/files';
+import { frameUrl } from '../files/versions';
 import { t } from '../i18n/t';
 import { useMediaQuery } from '../lib/useMediaQuery';
 
@@ -13,19 +14,13 @@ const FRAME_BORDER = {
   borderRadius: 'md',
 } as const;
 
-/** `&v=<finished_at>` cho bản dịch: dựng lại xong thì địa chỉ đổi → trình duyệt không hiện bản PDF cũ từ cache. */
-function frameUrl(item: FileItem, kind: DownloadKind): string {
-  const url = filesApi.viewUrl(item.id, kind);
-  return kind === 'translated' && item.finished_at ? `${url}&v=${encodeURIComponent(item.finished_at)}` : url;
-}
-
 function Frame({ item, kind }: { item: FileItem; kind: DownloadKind }) {
   const label = kind === 'original' ? t('viewer.original') : t('viewer.translated');
   return (
     <Box height="80vh" minHeight="480px" width="100%" overflow="hidden" {...FRAME_BORDER}>
       <iframe
         title={t('viewer.frameTitle', { name: item.filename, kind: label })}
-        src={frameUrl(item, kind)}
+        src={frameUrl(item, kind, null)}
         width="100%"
         height="100%"
         frameBorder={0}
@@ -34,6 +29,7 @@ function Frame({ item, kind }: { item: FileItem; kind: DownloadKind }) {
   );
 }
 
+/** Khung xem bản dịch HIỆN TẠI (tab Bản dịch / Bản gốc / So sánh). Bản cũ xem ở trang Phiên bản (`/files/:id/versions`). */
 export function PdfViewer({ item }: { item: FileItem }) {
   const wide = useMediaQuery('(min-width: 1024px)');
   const [view, setView] = useState<ViewKind>('translated');
