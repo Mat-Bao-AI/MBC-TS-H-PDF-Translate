@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { AdvanceOnly, RequireAuth } from '../../auth/RequireAuth';
 import { AppShell } from '../../components/AppShell';
 import { resetMetaCache } from '../../files/useMeta';
-import { styleOf } from '../../files/profiles';
+import { ENUM_FIELDS, fieldLabel, styleOf } from '../../files/profiles';
 import { t } from '../../i18n/t';
 import { META, MY_PROFILE, SEEDED_PROFILES, settingsWith, signedInAs } from '../../test/fixtures';
 import { bodies, holdRequests, mockApi, sequence } from '../../test/mockApi';
@@ -89,6 +89,20 @@ describe('ProfilesSettingsPage', () => {
     await user.click(dialog.getByRole('button', { name: t('profiles.form.save') }));
     await waitFor(() => expect(bodies(calls, 'POST', '/api/profiles')).toHaveLength(1));
     expect([...bodies(calls, 'POST', '/api/profiles')[0].name].length).toBeLessThanOrEqual(60);
+  });
+
+  it('scrolls the nine fields inside the dialog body while the save button stays outside the scroll area', async () => {
+    mockApi({ ...BASE });
+    renderProfiles();
+    const user = userEvent.setup();
+    await user.click(await within(await screen.findByTestId(`profile-${TECHNICAL.id}`)).findByRole('button', { name: t('profiles.action.edit') }));
+    const dialog = within(await screen.findByRole('dialog'));
+    const fields = dialog.getByTestId('profile-form-fields');
+    expect(getComputedStyle(fields).overflowY).toBe('auto');
+    const labels = [t('profiles.form.name'), ...ENUM_FIELDS.map(fieldLabel), fieldLabel('custom_instructions')];
+    expect(labels).toHaveLength(10);
+    for (const label of labels) expect(fields).toContainElement(dialog.getByLabelText(label));
+    expect(fields).not.toContainElement(dialog.getByRole('button', { name: t('profiles.form.save') }));
   });
 
   it('edits a seeded profile through the same form and sends the whole body to PUT', async () => {

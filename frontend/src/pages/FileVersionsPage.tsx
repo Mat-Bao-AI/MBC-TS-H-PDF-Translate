@@ -1,33 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import styled from '@emotion/styled';
-import { Alert, Badge, Box, Dialog, FillButton, FlexBox, FormGroup, Select, StrokeButton, Text, Toggle } from '@codecademy/gamut';
+import { Alert, Badge, Box, Dialog, FillButton, FlexBox, Text, Toggle } from '@codecademy/gamut';
 import { toApiError, type ApiError } from '../api/client';
 import { filesApi, isPending, type FileItem, type Meta } from '../api/files';
 import { BreadcrumbBand } from '../components/BreadcrumbBand';
 import { FilePlaceholder } from '../components/FilePlaceholder';
 import { PageContainer } from '../components/PageContainer';
-import { configRows, entriesOf, entryHeadline, entryTime, frameUrl, languageNamer, type VersionEntry } from '../files/versions';
+import { VersionTimeline } from '../components/VersionTimeline';
+import { configRows, entriesOf, entryHeadline, frameUrl, languageNamer, type VersionEntry } from '../files/versions';
 import { useFileItem } from '../files/useFileItem';
 import { useMeta } from '../files/useMeta';
 import { errorText, t } from '../i18n/t';
 import { useMediaQuery } from '../lib/useMediaQuery';
 
-// Gamut không có Stepper/Timeline: hàng mốc tự dựng bằng nút, cuộn ngang trên màn hẹp thay vì bẻ dòng từng mốc.
-const Timeline = styled.ol({ display: 'flex', gap: 8, listStyle: 'none', margin: 0, padding: '4px 0', overflowX: 'auto' });
-
 const WIDE = '(min-width: 1024px)';
-
-/** Nhãn một mốc / một option: "Bản 2 · hôm nay lúc 09:12" (+ "(lúc bị thay)" khi chỉ biết giờ bị thay — bản cất trước 1b). */
-function markLabel(entry: VersionEntry): string {
-  const time = entryTime(entry);
-  const name = t('detail.version.label', { n: entry.version_no });
-  return time ? `${name} · ${time}` : name;
-}
-
-/** Options của hai Select "So sánh hai bản bất kỳ": chỉ số → nhãn, bỏ bên kia (trái ≠ phải). */
-const optionsExcept = (entries: VersionEntry[], excluded: number | null): Record<string, string> =>
-  Object.fromEntries(entries.map((entry, index) => [String(index), markLabel(entry)] as const).filter(([index]) => Number(index) !== excluded));
 
 function Side({ item, entry, meta, side }: { item: FileItem; entry: VersionEntry | null; meta: Meta | null; side: 'left' | 'right' }) {
   if (!entry) {
@@ -76,28 +62,21 @@ function VersionsView({ id }: { id: string }) {
   const last = entries.length - 1;
   const indexOf = (key: string | null) => (key === null ? -1 : entries.findIndex((entry) => keyOf(entry) === key));
   const pinnedRight = indexOf(right);
-  const rightIndex = pinnedRight >= 0 ? pinnedRight : last; // bản đã ghim biến mất → về bản mới nhất
+  // So sánh hai bản cần trái < phải: bản phải ít nhất là Bản thứ hai (nếu có từ hai bản trở lên).
+  const rightIndex = Math.max(pinnedRight >= 0 ? pinnedRight : last, anyPair && last >= 1 ? 1 : 0); // bản đã ghim biến mất → về bản mới nhất
   const followLeft = rightIndex > 0 ? rightIndex - 1 : null;
   const pinnedLeft = indexOf(left);
-  const leftIndex = anyPair
-    ? (pinnedLeft >= 0 && pinnedLeft !== rightIndex ? pinnedLeft : (followLeft ?? (last >= 1 ? 1 : null)))
-    : followLeft;
+  const leftIndex = anyPair && pinnedLeft >= 0 && pinnedLeft < rightIndex ? pinnedLeft : followLeft;
   const leftEntry = leftIndex === null ? null : entries[leftIndex];
   const rightEntry = entries[rightIndex];
 
+  // So sánh hai bản (kiểu WordPress): kéo phải xuống tới trái thì ĐẨY trái xuống phải − 1; kéo trái lên tới phải thì kẹp ở phải − 1.
   const pickRight = (index: number) => {
-    const key = keyOf(entries[index]);
-    setRight(key);
-    if (anyPair && left === key) setLeft(null); // trái không được trùng phải: về mặc định (đi theo phải)
+    const next = Math.min(Math.max(index, anyPair ? 1 : 0), last);
+    setRight(keyOf(entries[next]));
+    if (anyPair && leftIndex !== null && next <= leftIndex) setLeft(keyOf(entries[next - 1]));
   };
-
-  // Select của Gamut là uncontrolled nên phải remount khi cặp đổi; remount làm mất focus → trả focus về ô vừa được người dùng đổi.
-  const refocus = useRef<string | null>(null);
-  useEffect(() => {
-    if (!refocus.current) return;
-    document.getElementById(refocus.current)?.focus();
-    refocus.current = null;
-  });
+  const pickLeft = (index: number) => setLeft(keyOf(entries[Math.min(Math.max(index, 0), rightIndex - 1)]));
 
   async function restore() {
     setConfirming(false); // đóng trước: lỗi hiện trên trang, không nằm sau hộp thoại
@@ -139,48 +118,13 @@ function VersionsView({ id }: { id: string }) {
       <Text color="text-secondary" fontSize={14} mt={4}>{t('versions.note')}</Text>
       {pending && <Box mt={16}><Alert type="notice" placement="inline">{t('versions.pendingNotice')}</Alert></Box>}
       {restoreError && <Box mt={16}><Alert type="error" placement="inline">{errorText(restoreError.code, restoreError.params)}</Alert></Box>}
-      <Box mt={16}>
-        <Timeline data-testid="timeline" aria-label={t('versions.timeline')}>
-          {entries.map((entry, index) => {
-            const isRight = index === rightIndex;
-            const isLeft = index === leftIndex;
-            // Mốc phải = FillButton, mốc khác = StrokeButton; cùng props + cùng nội dung (render điều kiện, không ghép kiểu component).
-            const props = { type: 'button' as const, size: 'small' as const, 'aria-pressed': isRight, onClick: () => pickRight(index), disabled: anyPair && isLeft, 'aria-current': isLeft ? ('true' as const) : undefined,
-              'data-muted': entry.available ? undefined : 'true' }; // mốc của bản mất tệp: làm mờ + nhãn "tệp không còn"
-
-            const content = (
-              <>
-                {entry.available || isRight ? markLabel(entry) : <Text as="span" color="text-secondary">{markLabel(entry)}</Text>}
-                {isLeft && <> <Badge variant="tertiary" size="sm">{t('versions.left')}</Badge></>}
-                {!entry.available && <> <Badge variant="tertiary" size="sm">{t('detail.version.missing')}</Badge></>}
-              </>
-            );
-            return (
-              <li key={entry.id ?? 'current'}>
-                {isRight ? <FillButton {...props}>{content}</FillButton> : <StrokeButton {...props}>{content}</StrokeButton>}
-              </li>
-            );
-          })}
-        </Timeline>
+      <Box mt={16} aria-label={t('versions.timeline')} role="group">
+        <VersionTimeline entries={entries} rightIndex={rightIndex} leftIndex={leftIndex} anyPair={anyPair} narrow={!wide}
+          onRightChange={pickRight} onLeftChange={pickLeft} />
       </Box>
-      <FlexBox gap={12} alignItems="center" flexWrap="wrap" mt={12}>
-        <StrokeButton type="button" size="small" onClick={() => pickRight(rightIndex - 1)} disabled={rightIndex === 0}><span aria-hidden="true">◀</span> {t('versions.prev')}</StrokeButton>
-        <StrokeButton type="button" size="small" onClick={() => pickRight(rightIndex + 1)} disabled={rightIndex === last}>{t('versions.next')} <span aria-hidden="true">▶</span></StrokeButton>
+      <Box mt={12}>
         <Toggle as="input" label={t('versions.anyPair')} checked={anyPair} onChange={() => { setAnyPair((value) => !value); setLeft(null); }} />
-      </FlexBox>
-      {anyPair && (
-        <FlexBox gap={16} flexWrap="wrap" mt={12}>
-          {/* Select của Gamut là uncontrolled: key theo cặp đang chọn để remount với defaultValue và options đúng. */}
-          <FormGroup label={t('versions.left')} htmlFor="compare-left" isSoloField>
-            <Select key={`left-${leftIndex}-${rightIndex}`} id="compare-left" defaultValue={String(leftIndex ?? '')}
-              options={optionsExcept(entries, rightIndex)} onChange={(event) => { refocus.current = 'compare-left'; setLeft(keyOf(entries[Number(event.target.value)])); }} />
-          </FormGroup>
-          <FormGroup label={t('versions.right')} htmlFor="compare-right" isSoloField>
-            <Select key={`right-${rightIndex}-${leftIndex}`} id="compare-right" defaultValue={String(rightIndex)}
-              options={optionsExcept(entries, leftIndex)} onChange={(event) => { refocus.current = 'compare-right'; pickRight(Number(event.target.value)); }} />
-          </FormGroup>
-        </FlexBox>
-      )}
+      </Box>
       <FlexBox flexDirection={wide ? 'row' : 'column'} gap={16} mt={24} data-testid="sides">
         <Box flexGrow={1} minWidth={0} width={wide ? '50%' : '100%'}><Side item={item} entry={leftEntry} meta={meta} side="left" /></Box>
         <Box flexGrow={1} minWidth={0} width={wide ? '50%' : '100%'}>

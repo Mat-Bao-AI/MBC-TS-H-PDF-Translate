@@ -2,7 +2,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { GamutProvider, theme } from '@codecademy/gamut-styles';
 import { describe, expect, it, vi } from 'vitest';
-import { STYLE_DEFAULTS } from '../files/profiles';
+import { ENUM_FIELDS, STYLE_DEFAULTS, fieldLabel } from '../files/profiles';
 import { t } from '../i18n/t';
 import { ProfileFormFields } from './ProfileFormFields';
 
@@ -26,5 +26,22 @@ describe('ProfileFormFields', () => {
     expect(onStyleChange).toHaveBeenLastCalledWith({ ...style, tone: 'friendly' });
     await user.type(screen.getByLabelText(t('profiles.field.custom_instructions')), 'c');
     expect(onStyleChange).toHaveBeenLastCalledWith({ ...style, custom_instructions: 'abc' });
+  });
+
+  it('packs the fields tightly: no group keeps the default loose margin or padding below it', () => {
+    const { container } = render(
+      <GamutProvider theme={theme}>
+        <ProfileFormFields idPrefix="x" name="A" style={STYLE_DEFAULTS} onNameChange={vi.fn()} onStyleChange={vi.fn()} />
+      </GamutProvider>,
+    );
+    const labels = [t('profiles.form.name'), ...ENUM_FIELDS.map(fieldLabel), fieldLabel('custom_instructions')];
+    expect(labels).toHaveLength(10);
+    for (const label of labels) {
+      for (let el: HTMLElement | null = screen.getByLabelText(label); el && el !== container; el = el.parentElement) {
+        const style = getComputedStyle(el);
+        expect(style.marginBottom, `${label}: margin-bottom`).not.toBe('24px'); // FormGroup mặc định "loose"
+        expect(style.paddingBottom, `${label}: padding-bottom`).not.toBe('8px');
+      }
+    }
   });
 });

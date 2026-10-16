@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type ComponentProps } from 'react';
+import styled from '@emotion/styled';
 import { Alert, Badge, Box, Card, Dialog, FillButton, FlexBox, StrokeButton, Text } from '@codecademy/gamut';
 import { toApiError, type ApiError } from '../../api/client';
 import { profilesApi } from '../../api/profiles';
@@ -11,6 +12,9 @@ import { cacheGet, cacheSet } from '../../lib/swrCache';
 
 const CACHE_KEY = TRANSLATION_SETTINGS_CACHE_KEY; // cùng bộ nhớ đệm với tab Dịch thuật: cả hai đọc GET /api/settings
 const SKELETON_HEIGHT = 520;
+// Dialog của Gamut cao tối đa (khung nhìn − 4rem) nhưng không tự cuộn: 9 trường làm ô cuối tràn khỏi khung. Chỉ vùng trường cuộn
+// (tiêu đề + nút Lưu/Huỷ luôn thấy); tràn 0.5rem sang hai bên để viền focus sát mép không bị cắt và thanh cuộn không đè ô nhập.
+const FieldsScroll = styled.div({ maxHeight: 'calc(100vh - 16rem)', overflowY: 'auto', margin: '0 -0.5rem', padding: '0 0.5rem 0.25rem' });
 type ConfirmCta = ComponentProps<typeof Dialog>['confirmCta'];
 type Editing = { title: string; id: string | null; initial: StyleValues & { name: string } };
 
@@ -60,7 +64,9 @@ function ProfileForm({ editing, onSubmit, onCancel }: { editing: Editing; onSubm
   return (
     <Dialog isOpen title={editing.title} size="medium" onRequestClose={onCancel} confirmCta={confirmCta}
       cancelCta={{ children: t('common.cancel'), onClick: onCancel }}>
-      <ProfileFormFields idPrefix="profile" name={name} style={style} onNameChange={setName} onStyleChange={setStyle} />
+      <FieldsScroll data-testid="profile-form-fields">
+        <ProfileFormFields idPrefix="profile" name={name} style={style} onNameChange={setName} onStyleChange={setStyle} />
+      </FieldsScroll>
     </Dialog>
   );
 }

@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -52,8 +52,12 @@ function renderVersions(routes: Parameters<typeof mockApi>[0] = {}) {
 }
 
 const label = (n: number) => new RegExp(`^${t('detail.version.label', { n })}`);
-const timeline = () => within(screen.getByTestId('timeline'));
-const mark = (n: number) => timeline().getByRole('button', { name: label(n) });
+const rightSlider = () => screen.getByRole('slider', { name: t('versions.sliderRight') });
+const leftSlider = () => screen.getByRole('slider', { name: t('versions.sliderLeft') });
+const tick = (n: number) => screen.getByTestId(`tick-${n}`);
+const setSlider = (slider: HTMLElement, n: number) => fireEvent.change(slider, { target: { value: String(n - 1) } });
+/** Chọn Bản n ở tay cầm phải (chỉ số = n − 1). */
+const pick = (n: number) => setSlider(rightSlider(), n);
 const left = () => within(screen.getByTestId('left-side'));
 const right = () => within(screen.getByTestId('right-side'));
 const heading = (side: ReturnType<typeof within>) => side.getByRole('heading', { level: 2 });
@@ -67,13 +71,20 @@ const QUEUED = { status: 'queued' as const, retranslating: true, rebuild_font: '
   retranslate_to: { language: 'vi', engine: 'google_free', model: null, font: 'auto' } };
 
 describe('FileVersionsPage', () => {
-  it('puts every version on the timeline oldest first and shows the latest on the right with its predecessor on the left', async () => {
+  it('puts every version on one slider, the latest on the right with its predecessor on the left', async () => {
+    stubMatchMedia(true); // màn rộng: mọi mốc đều có nhãn
     renderVersions();
-    const marks = await within(await screen.findByTestId('timeline')).findAllByRole('button');
-    expect(marks.map((button) => button.textContent)).toEqual([
+    await screen.findByTestId('timeline');
+    const slider = rightSlider();
+    expect(slider).toHaveAttribute('min', '0');
+    expect(slider).toHaveAttribute('max', '2');
+    expect(slider).toHaveValue('2');
+    expect(slider).toHaveAttribute('aria-valuetext', expect.stringContaining(t('detail.version.current')));
+    expect(slider).toHaveAttribute('aria-valuetext', expect.stringMatching(label(3)));
+    expect(screen.queryByRole('slider', { name: t('versions.sliderLeft') })).toBeNull();
+    expect(within(screen.getByTestId('ticks')).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
       expect.stringMatching(label(1)), expect.stringMatching(label(2)), expect.stringMatching(label(3)),
     ]);
-    expect(mark(3)).toHaveAttribute('aria-pressed', 'true');
     expect(heading(right())).toHaveTextContent(label(3));
     expect(heading(right())).toHaveTextContent(t('detail.version.current'));
     expect(heading(left())).toHaveTextContent(label(2));
@@ -84,11 +95,24 @@ describe('FileVersionsPage', () => {
     expect(within(nav).getByText(t('versions.crumb'))).toBeInTheDocument();
   });
 
+  it('moves the right side with the slider while the left stays the version just before it', async () => {
+    renderVersions();
+    await screen.findByTestId('timeline');
+    pick(1);
+    expect(rightSlider()).toHaveValue('0');
+    expect(heading(right())).toHaveTextContent(label(1));
+    expect(screen.getByTestId('left-empty')).toHaveTextContent(t('versions.noPrevious'));
+    pick(2);
+    expect(heading(right())).toHaveTextContent(label(2));
+    expect(heading(left())).toHaveTextContent(label(1));
+  });
+
   it('steps back and forward with Trước / Sau, says "Không có bản trước" at the oldest and highlights the rows that differ', async () => {
     renderVersions();
     const user = userEvent.setup();
     await screen.findByTestId('timeline');
     await user.click(prev());
+    expect(rightSlider()).toHaveValue('1');
     expect(heading(right())).toHaveTextContent(label(2));
     expect(heading(left())).toHaveTextContent(label(1));
     const table = within(screen.getByTestId('config-compare'));
@@ -101,23 +125,92 @@ describe('FileVersionsPage', () => {
     expect(prev()).toBeDisabled();
     await user.click(next());
     await user.click(next());
-    expect(mark(3)).toHaveAttribute('aria-pressed', 'true');
+    expect(rightSlider()).toHaveValue('2');
+    expect(heading(right())).toHaveTextContent(label(3));
     expect(next()).toBeDisabled();
   });
 
-  it('lets the user compare any two versions once the toggle is on, never the same one on both sides', async () => {
+  it('gives two handles on the same track in any-pair mode, never the same version on both sides', async () => {
     renderVersions();
     const user = userEvent.setup();
     await screen.findByTestId('timeline');
     await user.click(screen.getByRole('checkbox', { name: t('versions.anyPair') }));
-    expect(screen.getByLabelText(t('versions.right'))).toHaveValue('2'); // chỉ số của Bản 3
-    expect(within(screen.getByLabelText(t('versions.right'))).queryByRole('option', { name: label(2) })).toBeNull(); // đang là trái
-    await user.selectOptions(screen.getByLabelText(t('versions.left')), '0');
+    expect(leftSlider()).toHaveValue('1'); // Bản 2: ngay trước phải
+    expect(rightSlider()).toHaveValue('2');
+    expect(leftSlider()).toHaveAttribute('aria-valuetext', expect.stringMatching(label(2)));
+    setSlider(leftSlider(), 1);
+    setSlider(rightSlider(), 3);
     expect(heading(left())).toHaveTextContent(label(1));
     expect(heading(right())).toHaveTextContent(label(3));
-    expect(within(screen.getByLabelText(t('versions.right'))).queryByRole('option', { name: label(1) })).toBeNull();
-    expect(mark(1)).toBeDisabled(); // mốc đang là trái không chọn làm phải được
-    expect(mark(1)).toHaveTextContent(t('versions.left'));
+    setSlider(leftSlider(), 3); // trái ≥ phải → kẹp về phải − 1
+    expect(leftSlider()).toHaveValue('1');
+    expect(heading(left())).toHaveTextContent(label(2));
+    setSlider(rightSlider(), 1); // phải ≤ trái → ĐẨY trái xuống, phải tối thiểu là Bản 2
+    expect(rightSlider()).toHaveValue('1');
+    expect(leftSlider()).toHaveValue('0');
+    expect(heading(right())).toHaveTextContent(label(2));
+    expect(heading(left())).toHaveTextContent(label(1));
+    expect(prev()).toBeDisabled(); // phải ở chỉ số 1
+    setSlider(rightSlider(), 3);
+    setSlider(leftSlider(), 2);
+    expect(leftSlider()).toHaveValue('1');
+    await user.click(prev()); // Trước đẩy trái theo
+    expect(rightSlider()).toHaveValue('1');
+    expect(leftSlider()).toHaveValue('0');
+    expect(heading(left())).toHaveTextContent(label(1));
+    await user.click(screen.getByRole('checkbox', { name: t('versions.anyPair') })); // tắt: trái lại đi theo phải
+    expect(screen.queryByRole('slider', { name: t('versions.sliderLeft') })).toBeNull();
+    expect(heading(left())).toHaveTextContent(label(1));
+    pick(3);
+    expect(heading(left())).toHaveTextContent(label(2));
+  });
+
+  it('keeps the left handle below the right one even when the right was at the first version', async () => {
+    renderVersions();
+    const user = userEvent.setup();
+    await screen.findByTestId('timeline');
+    pick(1);
+    await user.click(screen.getByRole('checkbox', { name: t('versions.anyPair') }));
+    expect(leftSlider()).toHaveValue('0');
+    expect(rightSlider()).toHaveValue('1');
+  });
+
+  it('drops tick labels on a narrow screen except for the first, last and selected versions', async () => {
+    renderVersions({ [ONE]: { body: threeVersions({ version_no: 5, versions: [4, 3, 2, 1].map((n) =>
+      fileVersion({ id: `v0000000000${n}`, version_no: n, font_used: 'sans', translated_at: `2026-10-1${n}T10:00:00Z` })) }) } });
+    await screen.findByTestId('timeline');
+    pick(3);
+    expect(tick(1)).toHaveTextContent(label(1));
+    expect(tick(3)).toHaveTextContent(label(3));
+    expect(tick(5)).toHaveTextContent(label(5));
+    expect(tick(2)).not.toHaveTextContent(label(2));
+    expect(tick(4)).not.toHaveTextContent(label(4));
+    expect(screen.getAllByTestId(/^tick-/)).toHaveLength(5); // mốc vẫn còn
+  });
+
+  it('places the step buttons and the track in explicit grid cells', async () => {
+    renderVersions();
+    await screen.findByTestId('timeline');
+    const grid = screen.getByTestId('timeline');
+    const cell = (element: HTMLElement) => {
+      let node = element;
+      while (node.parentElement !== grid) node = node.parentElement!;
+      const style = getComputedStyle(node);
+      return [style.getPropertyValue('grid-row'), style.getPropertyValue('grid-column')];
+    };
+    expect(cell(prev())).toEqual(['2', '1']);
+    expect(cell(screen.getByTestId('track-cell'))).toEqual(['2', '2']);
+    expect(cell(next())).toEqual(['2', '3']);
+    expect(cell(screen.getByTestId('ticks'))).toEqual(['3', '2']);
+    expect(getComputedStyle(screen.getByTestId('timeline')).gridTemplateColumns).toMatch(/^auto minmax\(160px, 1fr\) auto$/);
+  });
+
+  it('labels every tick on a wide screen', async () => {
+    stubMatchMedia(true);
+    renderVersions({ [ONE]: { body: threeVersions({ version_no: 5, versions: [4, 3, 2, 1].map((n) =>
+      fileVersion({ id: `v0000000000${n}`, version_no: n, font_used: 'sans', translated_at: `2026-10-1${n}T10:00:00Z` })) }) } });
+    await screen.findByTestId('timeline');
+    for (const n of [1, 2, 3, 4, 5]) expect(tick(n)).toHaveTextContent(label(n));
   });
 
   it('shows both PDFs side by side on a wide screen, the old one from its version URL', async () => {
@@ -142,12 +235,12 @@ describe('FileVersionsPage', () => {
       fileVersion({ id: 'v00000000002', version_no: 2, font_used: 'sans', translated_at: '2026-10-14T10:00:00Z' }),
       fileVersion({ id: 'v00000000001', version_no: 1, font_used: 'sans', available: false }),
     ] }) } });
-    const user = userEvent.setup();
     await screen.findByTestId('timeline');
-    expect(mark(1)).toHaveTextContent(t('detail.version.missing'));
-    expect(mark(1)).toHaveAttribute('data-muted', 'true'); // mốc của bản mất tệp bị làm mờ, không chỉ có nhãn
-    expect(mark(2)).not.toHaveAttribute('data-muted');
-    await user.click(mark(1));
+    expect(within(tick(1)).getByRole('img', { name: t('detail.version.missing') })).toHaveAttribute('title', t('detail.version.missing'));
+    expect(tick(1)).toHaveAttribute('data-muted', 'true'); // mốc của bản mất tệp bị làm mờ, không chỉ có nhãn
+    expect(tick(2)).not.toHaveAttribute('data-muted');
+    pick(1);
+    expect(rightSlider()).toHaveAttribute('aria-valuetext', expect.stringContaining(t('detail.version.missing')));
     expect(right().getByText(t('detail.version.missing'))).toBeInTheDocument();
     expect(right().queryByTitle(t('versions.frameTitle', { name: 'Báo cáo.pdf', n: 1 }))).toBeNull();
     expect(restoreButton()).toBeDisabled();
@@ -158,7 +251,7 @@ describe('FileVersionsPage', () => {
       retranslate_to: { language: 'vi', engine: 'google_free', model: null, font: 'auto' } }) } });
     const user = userEvent.setup();
     expect(await screen.findByText(t('versions.pendingNotice'))).toBeInTheDocument();
-    await user.click(mark(2));
+    pick(2);
     expect(restoreButton()).toBeDisabled();
   });
 
@@ -167,14 +260,14 @@ describe('FileVersionsPage', () => {
     const { calls } = renderVersions({ [RESTORE]: { status: 202, body: restored } });
     const user = userEvent.setup();
     await screen.findByTestId('timeline');
-    await user.click(mark(2));
+    pick(2);
     await user.click(restoreButton());
     let dialog = within(await screen.findByRole('dialog'));
     expect(dialog.getByText(t('restore.body', { k: 2, n: 3, next: 4 }))).toBeInTheDocument();
     expect(dialog.getByText(t('restore.pruneNote'))).toBeInTheDocument();
     expect(dialog.queryByText(t('restore.noTables'))).toBeNull(); // Bản 2 có bảng
     await user.click(dialog.getByRole('button', { name: t('common.cancel') }));
-    await user.click(mark(1)); // Gemini, không bảng
+    pick(1); // Gemini, không bảng
     await user.click(restoreButton());
     dialog = within(await screen.findByRole('dialog'));
     expect(dialog.getByText(t('restore.noTables'))).toBeInTheDocument();
@@ -198,7 +291,7 @@ describe('FileVersionsPage', () => {
     );
     const user = userEvent.setup();
     await screen.findByTestId('timeline');
-    await user.click(mark(1));
+    pick(1);
     await user.click(restoreButton());
     // Trang chi tiết tự làm mới bị giữ lại: thứ nó hiện chỉ có thể đến từ phản hồi khôi phục đã ghi vào bộ nhớ đệm.
     const original = fetchMock.getMockImplementation()!;
@@ -226,7 +319,7 @@ describe('FileVersionsPage', () => {
     renderVersions({ [RESTORE]: { status: 409, body: { detail: { code: 'not_restorable' } } } });
     const user = userEvent.setup();
     await screen.findByTestId('timeline');
-    await user.click(mark(1));
+    pick(1);
     await user.click(restoreButton());
     await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: t('restore.confirm') }));
     expect(await screen.findByText(t('error.not_restorable'))).toBeInTheDocument();
@@ -234,14 +327,20 @@ describe('FileVersionsPage', () => {
     expect(restoreButton()).toBeEnabled();
   });
 
-  it('uses the translation time on the marks and falls back to the archive time for versions from before this release', async () => {
+  it('uses the translation time in the captions and falls back to the archive time for versions from before this release', async () => {
     renderVersions();
     await screen.findByTestId('timeline');
+    const caption = () => screen.getByTestId('caption-right');
     const archiveNote = t('versions.archivedAt', { time: '' }).trim();
-    expect(mark(1)).toHaveTextContent(t('versions.archivedAt', { time: formatRelative('2026-10-13T08:00:00Z') }));
-    expect(mark(2)).toHaveTextContent(formatRelative('2026-10-14T10:00:00Z'));
-    expect(mark(2)).not.toHaveTextContent(archiveNote);
-    expect(mark(3)).not.toHaveTextContent(archiveNote);
+    pick(1);
+    expect(caption()).toHaveTextContent(t('versions.archivedAt', { time: formatRelative('2026-10-13T08:00:00Z') }));
+    expect(rightSlider()).toHaveAttribute('aria-valuetext', expect.stringContaining(t('versions.archivedAt', { time: formatRelative('2026-10-13T08:00:00Z') })));
+    pick(2);
+    expect(caption()).toHaveTextContent(label(2));
+    expect(caption()).toHaveTextContent(formatRelative('2026-10-14T10:00:00Z'));
+    expect(caption()).not.toHaveTextContent(archiveNote);
+    pick(3);
+    expect(caption()).not.toHaveTextContent(archiveNote);
   });
 
   it('explains a missing file', async () => {
@@ -250,41 +349,44 @@ describe('FileVersionsPage', () => {
     expect(screen.getByRole('link', { name: t('common.backHome') })).toHaveAttribute('href', '/');
   });
 
-  it('keeps focus on the Select the user changed, on both sides', async () => {
+  it('keeps focus on the handle the user moved, on both sides', async () => {
     renderVersions();
     const user = userEvent.setup();
     await screen.findByTestId('timeline');
     await user.click(screen.getByRole('checkbox', { name: t('versions.anyPair') }));
-    await user.selectOptions(screen.getByLabelText(t('versions.left')), '0');
-    expect(screen.getByLabelText(t('versions.left'))).toHaveFocus();
-    await user.selectOptions(screen.getByLabelText(t('versions.right')), '1');
-    expect(screen.getByLabelText(t('versions.right'))).toHaveFocus();
+    leftSlider().focus();
+    setSlider(leftSlider(), 1);
+    expect(leftSlider()).toHaveFocus();
+    rightSlider().focus();
+    setSlider(rightSlider(), 2);
+    expect(rightSlider()).toHaveFocus();
     expect(heading(right())).toHaveTextContent(label(2));
   });
 
-  it('names the step buttons without the glyphs and flags the left mark programmatically', async () => {
+  it('names the step buttons without the glyphs and puts them around the slider in tab order', async () => {
     renderVersions();
     const user = userEvent.setup();
     await screen.findByTestId('timeline');
     expect(prev()).toHaveAccessibleName(t('versions.prev'));
     expect(next()).toHaveAccessibleName(t('versions.next'));
-    expect(mark(2)).toHaveAttribute('aria-current', 'true');
-    expect(mark(1)).not.toHaveAttribute('aria-current');
-    await user.click(prev());
-    expect(mark(1)).toHaveAttribute('aria-current', 'true');
+    pick(2); // giữa dải: cả hai nút đều bấm được
+    prev().focus();
+    await user.tab();
+    expect(rightSlider()).toHaveFocus();
+    await user.tab();
+    expect(next()).toHaveFocus();
   });
 
-  it('keeps the muted state and a badge on a selected mark whose file is gone', async () => {
+  it('keeps the muted state on the tick of a selected version whose file is gone', async () => {
     renderVersions({ [ONE]: { body: threeVersions({ versions: [
       fileVersion({ id: 'v00000000002', version_no: 2, font_used: 'sans', translated_at: '2026-10-14T10:00:00Z' }),
       fileVersion({ id: 'v00000000001', version_no: 1, font_used: 'sans', available: false }),
     ] }) } });
-    const user = userEvent.setup();
     await screen.findByTestId('timeline');
-    await user.click(mark(1));
-    expect(mark(1)).toHaveAttribute('aria-pressed', 'true');
-    expect(mark(1)).toHaveAttribute('data-muted', 'true');
-    expect(mark(1)).toHaveTextContent(t('detail.version.missing'));
+    pick(1);
+    expect(tick(1)).toHaveAttribute('data-muted', 'true');
+    expect(within(tick(1)).getByRole('img', { name: t('detail.version.missing') })).toHaveAttribute('title', t('detail.version.missing'));
+    expect(restoreButton()).toBeDisabled();
   });
 
   it('keeps a pinned side on the same version when the list grows, and falls back to the latest when it shrinks past it', async () => {
@@ -296,15 +398,15 @@ describe('FileVersionsPage', () => {
     const user = userEvent.setup();
     await screen.findByTestId('timeline');
     await user.click(screen.getByRole('checkbox', { name: t('versions.anyPair') }));
-    await user.selectOptions(screen.getByLabelText(t('versions.left')), '0'); // trái ghim Bản 1
-    await user.click(mark(2)); // phải ghim Bản 2
+    setSlider(leftSlider(), 1); // trái ghim Bản 1
+    pick(2); // phải ghim Bản 2
     expect(heading(left())).toHaveTextContent(label(1));
     served = threeVersions({ ...QUEUED, version_no: 4, versions: [v(3), v(2), v(1)] }); // dài hơn
-    await timeline().findByRole('button', { name: label(4) }, { timeout: 6000 });
+    await screen.findByTestId('tick-4', undefined, { timeout: 6000 });
     expect(heading(right())).toHaveTextContent(label(2));
     expect(heading(left())).toHaveTextContent(label(1));
     served = threeVersions({ status: 'done', version_no: 4, versions: [v(3)] }); // ngắn hơn: Bản 1, 2 bị tỉa
-    await waitFor(() => expect(timeline().queryByRole('button', { name: label(1) })).toBeNull(), { timeout: 6000 });
+    await waitFor(() => expect(screen.queryByTestId('tick-1')).toBeNull(), { timeout: 6000 });
     expect(heading(right())).toHaveTextContent(label(4)); // Bản 2 biến mất → bản mới nhất
     expect(heading(left())).toHaveTextContent(label(3)); // Bản 1 biến mất → mặc định đi theo phải
   });
