@@ -3,6 +3,7 @@ import { Box, FlexBox, IconButton, Text } from '@codecademy/gamut';
 // Deep import: gói không xuất DataGrid ở gốc, DataTable không chọn dòng, DataList không có kiểu bảng (test DataGrid.test.ts canh việc này khi nâng Gamut).
 import { DataGrid } from '@codecademy/gamut/dist/DataList/DataGrid';
 import type { OnQueryChange, Query } from '@codecademy/gamut';
+import { breakpoints } from '@codecademy/gamut-styles';
 import { DownloadIcon, FileDownloadIcon, PdfIcon, RedoIcon, TrashIcon, ViewIcon } from '@codecademy/gamut-icons';
 import { useLayoutEffect, useRef, type ComponentProps, type MouseEvent, type ReactNode } from 'react';
 import { filesApi, hasTranslation, isPending, type FileItem, type Meta, type SortDir, type SortKey } from '../api/files';
@@ -45,7 +46,30 @@ type Props = {
 
 // Khung cuộn của DataTable (overflow: auto) bị vòng focus/hover của nút ở hàng cuối (::before/::after, bottom -3…-5px)
 // đẩy cao hơn bảng 3px → 1–2 lần lăn chuột trên bảng cuộn khung này thay vì trang. Chỉ cho cuộn ngang; paddingBottom 6px chừa chỗ cho vòng focus để không bị cắt.
-const TableFrame = styled.div({ '& div:has(> table)': { overflowY: 'hidden', paddingBottom: 6 } });
+const TableFrame = styled.div({
+  '& div:has(> table)': { overflowY: 'hidden', paddingBottom: 6 },
+  // Hai luật dưới chỉ dành cho bố cục hàng ngang. Gamut chuyển sang xếp chồng (flex-direction: column) khi
+  // container hẹp hơn breakpoint `sm` (768px, @container — cùng truy vấn với c_sm của ListCol/ListRow); ở đó flex-basis 0
+  // sẽ làm xẹp CHIỀU CAO ô tên (mất tiêu đề "Tên").
+  [`@container (min-width: ${breakpoints.sm})`]: {
+    // Gamut 73.6.1: ô chọn-tất-cả ở thead dựng thiếu `type: "select"` (ô chọn từng hàng ở tbody thì có) nên dày hơn 8px
+    // padding-right → mọi cột ở tiêu đề lệch 8px so với dữ liệu. Ép về cùng padding-right 0 để hai bên trùng toạ độ x.
+    // Giả định lưới có `selectable` (có ô chọn, là <td> đầu hàng); không có ô chọn thì luật này không khớp phần tử nào.
+    '& thead tr > td:first-of-type': { paddingRight: 0 },
+    // Cột tên là cột `type: 'header'` duy nhất nên là <th> duy nhất của hàng (ô chọn là <td>) → `th:first-of-type` đúng là cột tên.
+    // Mặc định nó `flex: 0 0 auto; overflow: visible` nên không co, không cắt: tên dài tràn sang cột sau. Cho nó nhận phần
+    // chiều rộng còn lại, co được và cắt phần thừa.
+    '& thead tr > th:first-of-type': { flex: '1 1 0', minWidth: 0 },
+    // Chỉ ô thân mới cắt (overflow: hidden); ô tiêu đề ngắn nên không cắt để vòng focus của nút sắp xếp "Tên" không bị xén.
+    '& tbody tr > th:first-of-type': { flex: '1 1 0', minWidth: 0, overflow: 'hidden' },
+  },
+});
+
+// Anchor của Gamut là inline-block + white-space: normal nên tự xuống dòng ở dấu gạch ngang; ép nó thành block vừa khung
+// và cắt CHỮ bên trong (NameText), không cắt chính anchor để vòng focus không bị xén. Tên đầy đủ hiện ở tooltip gốc;
+// tên truy cập của link vẫn là tên đầy đủ. paddingRight chừa chỗ cho vòng focus ở mép phải ô tên.
+const NameLine = styled.div({ paddingRight: 2, '& a': { display: 'block', maxWidth: '100%' } });
+const NameText = styled.span({ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' });
 
 // Mọi icon thao tác chiếm đúng một ô cố định (2rem, cỡ IconButton small) để các hàng thẳng cột.
 const Slot = ({ children }: { children?: ReactNode }) => (
@@ -127,9 +151,11 @@ export function FileTable({
             key: 'filename', header: t('home.col.name'), size: 'xl', fill: true, type: 'header', sortable: true,
             render: (item) => (
               <FlexBox gap={12} alignItems="center" minWidth={0}>
-                <PdfIcon size={24} color="feedback-error" aria-hidden />
-                <Box minWidth={0}>
-                  <RouterAnchor to={`/files/${item.id}`} variant="interface">{item.filename}</RouterAnchor>
+                <Box flexShrink={0}><PdfIcon size={24} color="feedback-error" aria-hidden /></Box>
+                <Box minWidth={0} flex={1}>
+                  <NameLine title={item.filename}>
+                    <RouterAnchor to={`/files/${item.id}`} variant="interface"><NameText>{item.filename}</NameText></RouterAnchor>
+                  </NameLine>
                   <Text block fontSize={14} color="text-secondary" truncate="ellipsis" truncateLines={1}>
                     {fileCaption(item, languageNames[item.language] ?? item.language, meta)}
                   </Text>
